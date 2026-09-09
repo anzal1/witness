@@ -1,0 +1,5 @@
+/target
+witness-data/
+*.key
+proof.json
+chain.json
