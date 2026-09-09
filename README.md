@@ -2,6 +2,12 @@
 
 **A flight recorder for AI agent fleets that pays for itself.**
 
+[![ci](https://github.com/anzal1/witness/actions/workflows/ci.yml/badge.svg)](https://github.com/anzal1/witness/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/anzal1/witness)](https://github.com/anzal1/witness/releases)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+![witness demo: 803ms cache miss, 541µs hit, 403 capability denial, Merkle commit, audit with agent attribution](assets/demo.gif)
+
 `witness` is a single-binary, API-compatible proxy that sits between your agents and a model API. Agents change one line — the base URL — and every call is:
 
 - **recorded** — request and response stored in a content-addressed object store, referenced from a hash-chained journal (tamper-evident: any edit, deletion, or reorder breaks the chain);
@@ -26,6 +32,8 @@ Real usage:
 witness serve --port 8787 --upstream https://api.anthropic.com --cache
 # then point your agents at http://127.0.0.1:8787 instead of api.anthropic.com
 ```
+
+Adoption is one changed line in your existing code — see [examples/](examples/) for the Anthropic SDK (Python/TS), LangGraph, and a fully signed shell flow.
 
 ## Identity (Pact)
 
@@ -57,6 +65,14 @@ Every response carries `x-witness-seq`, `x-witness-req`, `x-witness-resp` (BLAKE
 ## Cache policy (honest by design)
 
 LLM calls are nondeterministic. Everything is **recorded**, but a response is only **reused** when that's semantically sound: `temperature: 0`, an explicit `seed`, or the caller opting in with `x-witness-cache: allow`. Replay mode reuses everything — that's its point.
+
+## How it compares
+
+| Tool | What it is | What witness adds |
+| --- | --- | --- |
+| LiteLLM / Helicone | LLM proxies with logging & caching | Tamper-evident hash chain, signed per-agent identity, third-party-checkable proofs |
+| Dapr 1.18 attestation | Workflow-history signing | Model-call granularity, delegation enforcement at the boundary, replay-as-cache |
+| OpenTelemetry GenAI | Trace schema / telemetry | The traces are *evidence*, not just observability — and the cache means they pay for themselves |
 
 ## What this does NOT do
 
