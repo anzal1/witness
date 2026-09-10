@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1000 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="wit-deleg-title wit-deleg-desc">
+      <title id="wit-deleg-title">Narrowing-only delegation chain</title>
+      <desc id="wit-deleg-desc">A human root key grants an agent access to Claude models, that agent may sub-delegate an equal or narrower grant to a child agent, and any attempt to sub-delegate a wider grant fails signature-chain verification before the request is ever made.</desc>
+      <defs>
+  <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;display=swap');</style>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#5B6570"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#E8552D"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2E5AA8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#faf8f5"/>
+
+      <!-- connectors: root drop, sibling bus, child drops -->
+      <line x1="500" y1="152" x2="500" y2="192" stroke="#5B6570" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="500" y1="248" x2="500" y2="288" stroke="#5B6570" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 588,220 H 668 Q 676,220 676,228 V 288" fill="none" stroke="#E8552D" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-accent)"/>
+
+      <!-- nodes -->
+      <rect x="404" y="96" width="192" height="56" rx="6" fill="#faf8f5"/>
+      <rect x="404" y="96" width="192" height="56" rx="6" fill="#5b6570" fill-opacity="0.10" stroke="#8B93A1" stroke-width="1"/>
+      <rect x="412" y="104" width="40" height="12" rx="2" fill="none" stroke="#5b6570" stroke-opacity="0.40" stroke-width="0.8"/>
+      <text x="432" y="112" fill="#5b6570" fill-opacity="0.80" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HUMAN</text>
+      <text x="500" y="132" fill="#15181C" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Root key</text>
+      <text x="500" y="144" fill="#5B6570" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">model:*</text>
+
+      <rect x="404" y="192" width="184" height="56" rx="6" fill="#faf8f5"/>
+      <rect x="404" y="192" width="184" height="56" rx="6" fill="#ffffff" stroke="#15181C" stroke-width="1"/>
+      <rect x="412" y="200" width="40" height="12" rx="2" fill="none" stroke="#15181c" stroke-opacity="0.40" stroke-width="0.8"/>
+      <text x="432" y="208" fill="#15181c" fill-opacity="0.80" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">AGENT</text>
+      <text x="496" y="228" fill="#15181C" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Agent A</text>
+      <text x="496" y="240" fill="#5B6570" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">model:claude-*</text>
+
+      <rect x="376" y="288" width="248" height="56" rx="6" fill="#faf8f5"/>
+      <rect x="376" y="288" width="248" height="56" rx="6" fill="#ffffff" stroke="#15181C" stroke-width="1"/>
+      <rect x="384" y="296" width="32" height="12" rx="2" fill="none" stroke="#15181c" stroke-opacity="0.40" stroke-width="0.8"/>
+      <text x="400" y="304" fill="#15181c" fill-opacity="0.80" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SUB</text>
+      <text x="500" y="324" fill="#15181C" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Sub-agent B — accepted</text>
+      <text x="500" y="336" fill="#5B6570" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">model:claude-sonnet-5</text>
+
+      <rect x="656" y="288" width="248" height="56" rx="6" fill="#faf8f5"/>
+      <rect x="656" y="288" width="248" height="56" rx="6" fill="#e8552d" fill-opacity="0.08" stroke="#E8552D" stroke-width="1"/>
+      <rect x="664" y="296" width="48" height="12" rx="2" fill="none" stroke="#e8552d" stroke-opacity="0.40" stroke-width="0.8"/>
+      <text x="688" y="304" fill="#E8552D" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">DENIED</text>
+      <text x="780" y="324" fill="#15181C" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Escalation — rejected</text>
+      <text x="780" y="336" fill="#E8552D" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">model:* wider than parent</text>
+
+      <!-- legend -->
+      <line x1="32" y1="412" x2="968" y2="412" stroke="#15181c" stroke-opacity="0.10" stroke-width="0.8"/>
+      <text x="32" y="432" fill="#5B6570" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <rect x="140" y="424" width="12" height="12" rx="2" fill="#5b6570" fill-opacity="0.10" stroke="#8B93A1" stroke-width="1"/>
+      <text x="160" y="432" fill="#5B6570" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">HUMAN ROOT</text>
+      <rect x="380" y="424" width="12" height="12" rx="2" fill="#ffffff" stroke="#15181C" stroke-width="1"/>
+      <text x="400" y="432" fill="#5B6570" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">VALID GRANT</text>
+      <rect x="620" y="424" width="12" height="12" rx="2" fill="#e8552d" fill-opacity="0.08" stroke="#E8552D" stroke-width="1"/>
+      <text x="640" y="432" fill="#5B6570" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">FAILS VERIFICATION</text>
+    </svg>
