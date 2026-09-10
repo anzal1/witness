@@ -79,6 +79,24 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Print Pact headers for a request body, for use with curl or load tests.
+    /// Signatures stay valid for the proxy's clock-skew window (5 minutes).
+    Sign {
+        #[arg(long, default_value = "/v1/messages")]
+        path: String,
+        /// Signing key.
+        #[arg(long)]
+        key: PathBuf,
+        /// Delegation chain file.
+        #[arg(long)]
+        chain: Option<PathBuf>,
+        /// Body file to sign; defaults to reading stdin.
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Emit as curl -H arguments instead of plain "Name: value" lines.
+        #[arg(long)]
+        curl: bool,
+    },
     /// Send a signed request through the proxy (test client).
     Call {
         #[arg(long, default_value = "http://127.0.0.1:8787")]
@@ -220,6 +238,46 @@ async fn main() -> Result<()> {
                 .context("resulting chain does not verify")?;
             std::fs::write(&out, serde_json::to_vec_pretty(&chain)?)?;
             eprintln!("wrote chain ({} links) to {}", chain.len(), out.display());
+            Ok(())
+        }
+        Command::Sign {
+            path,
+            key,
+            chain,
+            body_file,
+            curl,
+        } => {
+            let key = Keypair::load(&key)?;
+            let body = match body_file {
+                Some(f) => std::fs::read(&f).with_context(|| format!("reading {}", f.display()))?,
+                None => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf)?;
+                    buf
+                }
+            };
+            let ts = journal::now_ms();
+            let sig = witness::identity::sign_request(&key, "POST", &path, ts, &body);
+            let mut headers = vec![
+                (witness::identity::HDR_IDENTITY, key.public_hex()),
+                (witness::identity::HDR_TIMESTAMP, ts.to_string()),
+                (witness::identity::HDR_SIGNATURE, sig),
+            ];
+            if let Some(chain_path) = chain {
+                let chain: Vec<Delegation> = serde_json::from_slice(&std::fs::read(&chain_path)?)?;
+                headers.push((
+                    witness::identity::HDR_DELEGATION,
+                    witness::identity::chain_to_b64(&chain)?,
+                ));
+            }
+            for (name, value) in headers {
+                if curl {
+                    println!("-H '{name}: {value}'");
+                } else {
+                    println!("{name}: {value}");
+                }
+            }
             Ok(())
         }
         Command::Call {

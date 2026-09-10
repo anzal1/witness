@@ -66,6 +66,35 @@ Every response carries `x-witness-seq`, `x-witness-req`, `x-witness-resp` (BLAKE
 
 LLM calls are nondeterministic. Everything is **recorded**, but a response is only **reused** when that's semantically sound: `temperature: 0`, an explicit `seed`, or the caller opting in with `x-witness-cache: allow`. Replay mode reuses everything — that's its point.
 
+## Overhead (measured, not claimed)
+
+`bench/bench.sh` (needs [oha](https://github.com/hatoo/oha)) runs the mock upstream at `--latency-ms 0` so witness's own cost isn't hidden behind simulated inference. Four scenarios isolate each layer; numbers below are the median of 3 runs at n=2000, c=20 on an M-series MacBook:
+
+| scenario | p50 | p99 | req/s | added p50 |
+| --- | --- | --- | --- | --- |
+| `direct` (baseline, straight to upstream) | 0.29 ms | 0.48 ms | 63k | — |
+| `record` (CAS write + journal append) | 0.54 ms | 1.2 ms | 34k | **+0.25 ms** |
+| `record+sign` (adds Ed25519 + chain verify) | 0.56 ms | 1.2 ms | 33k | **+0.27 ms** |
+| `cache-hit` (served from the record) | 0.44 ms | 1.4 ms | 43k | +0.15 ms |
+
+Reading these honestly:
+
+- **Recording costs about a quarter of a millisecond** at the median. Against a model call that takes 2–30 *seconds*, that is roughly 0.01% overhead.
+- **Signed identity is nearly free** — the delta between `record` and `record+sign` is ~20 µs, which is Ed25519 verification doing what Ed25519 does.
+- **p99 shows occasional multi-millisecond outliers** (filesystem scheduling on the journal append). Sub-millisecond median, low-single-digit-millisecond tail — not a hard sub-ms p99 guarantee.
+- **A cache hit's real saving isn't the 0.44 ms** — it's the entire upstream inference call that never happens.
+
+Throughput plateaus around **37k recorded calls/sec** on this machine, and past that ceiling latency grows with concurrency (queueing, as expected):
+
+| concurrency | p50 | p99 | req/s |
+| --- | --- | --- | --- |
+| 20 | 0.52 ms | 1.4 ms | 35k |
+| 50 | 1.25 ms | 3.0 ms | 38k |
+| 100 | 2.46 ms | 8.4 ms | 37k |
+| 200 | 4.73 ms | 13.3 ms | 37k |
+
+The limiter is the journal's serialized append — see [#9](https://github.com/anzal1/witness/issues/9) for the batched group-commit fix. For scale context: OpenAI's 10,000-agent run averaged ~8.5 messages/sec, about 4,000× below this ceiling. The model API will be your bottleneck, not witness.
+
 ## How it compares
 
 | Tool | What it is | What witness adds |

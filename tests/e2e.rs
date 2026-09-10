@@ -260,3 +260,52 @@ async fn required_mode_rejects_anonymous() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Regression: under concurrency, identical requests raced in the CAS on a
+/// shared temp path and ~2% of them returned 500. Every request must succeed
+/// and every success must land in the journal exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_identical_requests_all_recorded() {
+    let dir = std::env::temp_dir().join(format!("witness-e2e-conc-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let mock_port = 39720;
+    let port = 39721;
+    tokio::spawn(mock::serve(mock_port, 0));
+    let proxy_dir = dir.clone();
+    tokio::spawn(async move {
+        proxy::serve(proxy::Options {
+            port,
+            upstream: format!("http://127.0.0.1:{mock_port}"),
+            data_dir: proxy_dir,
+            mode: proxy::Mode::Open,
+            trust: Vec::new(),
+            cache: false, // force the record+forward path every time
+            replay: false,
+        })
+        .await
+        .unwrap();
+    });
+    wait_for(mock_port).await;
+    wait_for(port).await;
+
+    const N: usize = 200;
+    let b = body("identical concurrent request", "claude-sonnet-5");
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let b = b.clone();
+        tasks.push(tokio::spawn(async move { post(port, &b, vec![]).await.0 }));
+    }
+    let mut ok = 0usize;
+    for task in tasks {
+        if task.await.unwrap() == 200 {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, N, "every concurrent request must succeed");
+
+    let records = Journal::read_all_from(&dir.join("journal.log")).unwrap();
+    Journal::verify_chain(&records).unwrap();
+    assert_eq!(records.len(), N, "one journal record per request");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

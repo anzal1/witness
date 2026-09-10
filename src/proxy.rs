@@ -66,6 +66,7 @@ pub struct App {
     cache_dir: PathBuf,
     hits: AtomicU64,
     misses: AtomicU64,
+    tmp_counter: AtomicU64,
 }
 
 impl App {
@@ -79,7 +80,25 @@ impl App {
     }
 
     fn cache_put(&self, req_key: &str, entry: &CacheEntry) -> Result<()> {
-        std::fs::write(self.cache_path(req_key), serde_json::to_vec(entry)?)?;
+        // Atomic publish: concurrent writers of the same key must never leave
+        // a torn index file behind, which would silently disable caching.
+        let path = self.cache_path(req_key);
+        // The first recorded response for a key is the canonical one, so this
+        // is write-once. Skipping the rewrite keeps repeat traffic off the
+        // filesystem entirely — the hot path for any real fleet.
+        if path.exists() {
+            return Ok(());
+        }
+        let tmp = path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            self.tmp_counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&tmp, serde_json::to_vec(entry)?)?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(e.into());
+        }
         Ok(())
     }
 }
@@ -102,6 +121,7 @@ pub async fn serve(opts: Options) -> Result<()> {
         cache_dir,
         hits: AtomicU64::new(0),
         misses: AtomicU64::new(0),
+        tmp_counter: AtomicU64::new(0),
     });
 
     let router = Router::new().fallback(handle).with_state(app);
