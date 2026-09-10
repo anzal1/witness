@@ -1,6 +1,6 @@
 # witness
 
-**A flight recorder for AI agent fleets that pays for itself.**
+**A recording cache for model APIs. You install it to cut inference spend and make crashed runs resumable — the byproduct is a record you can prove things about.**
 
 [![ci](https://github.com/anzal1/witness/actions/workflows/ci.yml/badge.svg)](https://github.com/anzal1/witness/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/anzal1/witness)](https://github.com/anzal1/witness/releases)
@@ -8,15 +8,18 @@
 
 ![witness demo: 803ms cache miss, 541µs hit, 403 capability denial, Merkle commit, audit with agent attribution](assets/demo.gif)
 
-`witness` is a single-binary, API-compatible proxy that sits between your agents and a model API. Agents change one line — the base URL — and every call is:
+`witness` is a single-binary, API-compatible proxy between your agents and a model API. Agents change one line — the base URL. Then:
 
-- **recorded** — request and response stored in a content-addressed object store, referenced from a hash-chained journal (tamper-evident: any edit, deletion, or reorder breaks the chain);
-- **attributed** — agents sign requests with Ed25519 keys and carry delegation chains from a human root key, verified locally at the proxy with zero network calls (the **Pact** protocol);
-- **cached** — identical deterministic requests are served from the record instead of re-paying inference; a whole run can be **replayed** later with zero model calls (the **AgentReplay** protocol);
-- **enforced** — delegations are narrowing-only capability grants (`model:claude-*`); a request outside the grant is refused *at the network boundary*, not by policy;
-- **provable** — a Merkle commitment over the journal lets you hand a third party an inclusion proof for any record, or answer *"did any agent ever touch X?"* against a committed root.
+- **repeat calls stop costing money** — every request and response is stored by content hash, so an identical deterministic call is served from the record instead of re-paying inference;
+- **crashed runs resume instead of restarting** — a whole run can be **replayed** from the record with zero model calls (the **AgentReplay** protocol);
+- **the record is tamper-evident** — entries live in a hash-chained journal, so any edit, deletion, or reorder breaks the chain and `witness verify` finds it;
+- **calls are attributed** — agents sign requests with Ed25519 keys carrying delegation chains from a human root key, verified locally with zero network calls (the **Pact** protocol);
+- **grants are enforced, not just logged** — delegations are narrowing-only (`model:claude-*`), and a request outside the grant is refused at the network boundary before it reaches the provider;
+- **single records are provable to outsiders** — a Merkle commitment lets you hand a third party an inclusion proof, or answer *"did any agent ever touch X?"* against a committed root.
 
-That last question is the one OpenAI could not answer in September 2026, when it [could not rule out](https://venturebeat.com/technology/openai-solves-longstanding-math-problem-with-10-000-agent-swarm-but-cant-rule-out-benefitting-from-a-researchers-private-codex-data) that a researcher's private data had leaked into its 10,000-agent Navier–Stokes run. With witness in the path, that's `witness audit --contains <x>` — with a proof.
+The ordering is the whole design bet. Audit tooling that asks to be adopted on principle doesn't get adopted, and a recorder switched on *after* a question is asked is worthless. So the thing you install for cost is the thing that turns out to be evidence — already running before anyone needed it.
+
+This is a crowded, fast-moving space and several projects overlap heavily with this one. See [Prior art](#prior-art--read-this-before-you-adopt-it) before adopting — if you need a production agent gateway today, [Wirken](https://github.com/gebruder/wirken) is probably the better starting point.
 
 ## Quickstart
 
@@ -95,13 +98,28 @@ Throughput plateaus around **37k recorded calls/sec** on this machine, and past 
 
 The limiter is the journal's serialized append — see [#9](https://github.com/anzal1/witness/issues/9) for the batched group-commit fix. For scale context: OpenAI's 10,000-agent run averaged ~8.5 messages/sec, about 4,000× below this ceiling. The model API will be your bottleneck, not witness.
 
-## How it compares
+## Prior art — read this before you adopt it
 
-| Tool | What it is | What witness adds |
+This is a crowded space, and several projects overlap heavily with witness. Some are more mature. An honest map:
+
+| Project | Overlap with witness | Where it is ahead |
 | --- | --- | --- |
-| LiteLLM / Helicone | LLM proxies with logging & caching | Tamper-evident hash chain, signed per-agent identity, third-party-checkable proofs |
-| Dapr 1.18 attestation | Workflow-history signing | Model-call granularity, delegation enforcement at the boundary, replay-as-cache |
-| OpenTelemetry GenAI | Trace schema / telemetry | The traces are *evidence*, not just observability — and the cache means they pay for themselves |
+| **[Wirken](https://github.com/gebruder/wirken)** (Rust, MIT) | Very high — per-agent Ed25519 identity signing a hash-chain head, SHA-256 chain, offline `sessions verify`, reproducible replay, capability-attenuated sub-agent delegation | Credential vault, per-channel process isolation, sandboxed exec, SIEM forwarding, OTel GenAI semconv. Bigger, older, actively developed |
+| **[Bifrost](https://docs.getbifrost.ai/overview)** (commercial) | HMAC-signed audit events at creation, append-only archival | ~11µs gateway overhead vs witness's ~250µs |
+| **[LiteLLM](https://github.com/BerriAI/litellm/discussions/25237)** (PRs #25329 / #30238) | Per-call post-quantum (ML-DSA-65) signature chaining, offline verification | Lives inside the most widely deployed LLM proxy |
+| **[Armalo](https://www.armalo.ai/learn/merkle-tree-agent-audit-logs)** | Merkle audit logs **anchored to Sigstore Rekor** with inclusion proofs | Already ships the external anchoring that is only issue #2 here |
+| **[IETF draft-maintainer-1f916-agent-record](https://datatracker.ietf.org/doc/draft-maintainer-1f916-agent-record/)** | Ed25519-bound append-only logs, signed Merkle heads, independent countersigning witnesses | It is becoming a **standard**; witness currently implements a bespoke format |
+| LiteLLM / Helicone / Portkey (base features) | Proxying, caching, logging | Mature, hosted, multi-provider |
+| Dapr 1.18 attestation, OTel GenAI semconv | Workflow-history signing; trace schema | Established ecosystems |
+
+**So what is actually different here?** Narrower than the feature list suggests:
+
+1. **The cache is the point, the record is the byproduct.** Other tools sell audit as audit. Witness is built so the thing you install for cost and crash-resumption *is* the evidence store — so it is already running before anyone asks a question. Nobody else makes that the primary bet.
+2. **Publicly verifiable rather than self-asserted.** Bifrost's HMAC means only the secret-holder can check a record; Ed25519 means anyone can. (Wirken and the IETF draft also use Ed25519.)
+3. **Capabilities narrowed by signature, not by config.** Wirken's sub-agent ceilings are operator-configured policy; here a child grant that widens its parent's cannot be produced at all.
+4. **One-line adoption.** Witness is a `base_url` change in front of any existing stack, not a runtime to migrate onto.
+
+If you need a production agent gateway today, look at Wirken first. If you want a drop-in recording cache whose records happen to be independently verifiable, that is what this is.
 
 ## What this does NOT do
 
