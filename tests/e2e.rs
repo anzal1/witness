@@ -101,6 +101,7 @@ async fn full_lifecycle() {
             trust: Vec::new(),
             cache: true,
             replay: false,
+            otlp_endpoint: None,
         })
         .await
         .unwrap();
@@ -197,6 +198,7 @@ async fn full_lifecycle() {
             trust: Vec::new(),
             cache: true,
             replay: true,
+            otlp_endpoint: None,
         })
         .await
         .unwrap();
@@ -240,6 +242,7 @@ async fn required_mode_rejects_anonymous() {
             trust,
             cache: false,
             replay: false,
+            otlp_endpoint: None,
         })
         .await
         .unwrap();
@@ -281,6 +284,7 @@ async fn concurrent_identical_requests_all_recorded() {
             trust: Vec::new(),
             cache: false, // force the record+forward path every time
             replay: false,
+            otlp_endpoint: None,
         })
         .await
         .unwrap();
@@ -306,6 +310,323 @@ async fn concurrent_identical_requests_all_recorded() {
     let records = Journal::read_all_from(&dir.join("journal.log")).unwrap();
     Journal::verify_chain(&records).unwrap();
     assert_eq!(records.len(), N, "one journal record per request");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Scrape the text exposition endpoint.
+async fn scrape(port: u16) -> String {
+    reqwest::get(format!(
+        "http://127.0.0.1:{port}{}",
+        witness::proxy::METRICS_PATH
+    ))
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap()
+}
+
+/// Value of one fully-qualified series line, labels included.
+fn series(text: &str, name: &str) -> f64 {
+    let line = text
+        .lines()
+        .find(|l| {
+            l.strip_prefix(name)
+                .map(|rest| rest.starts_with(' '))
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| panic!("no series `{name}` in exposition:\n{text}"));
+    line.rsplit(' ').next().unwrap().parse().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_endpoint_counts_traffic() {
+    let dir = std::env::temp_dir().join(format!("witness-e2e-metrics-{}", std::process::id()));
+    let dead_dir = dir.with_extension("dead");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dead_dir).ok();
+
+    let mock_port = 39730;
+    let port = 39731;
+    let replay_port = 39732;
+    let dead_port = 39733;
+    // Nothing ever binds this: it is how we provoke an upstream error.
+    let unbound_port = 39739;
+
+    tokio::spawn(mock::serve(mock_port, 0));
+    let proxy_dir = dir.clone();
+    tokio::spawn(async move {
+        proxy::serve(proxy::Options {
+            port,
+            upstream: format!("http://127.0.0.1:{mock_port}"),
+            data_dir: proxy_dir,
+            mode: proxy::Mode::Open,
+            trust: Vec::new(),
+            cache: true,
+            replay: false,
+            otlp_endpoint: None,
+        })
+        .await
+        .unwrap();
+    });
+    wait_for(mock_port).await;
+    wait_for(port).await;
+
+    // miss, then hit on the identical body, then one signed miss.
+    let b = body("metrics lemma", "claude-sonnet-5");
+    assert_eq!(post(port, &b, vec![]).await.2.as_deref(), Some("miss"));
+    assert_eq!(post(port, &b, vec![]).await.2.as_deref(), Some("hit"));
+
+    let agent = Keypair::generate().unwrap();
+    let signed = body("signed metrics lemma", "claude-sonnet-5");
+    let headers = signed_headers(&agent, None, &signed);
+    assert_eq!(post(port, &signed, headers).await.0, 200);
+
+    // Scraping is itself free: it must not count as a request or a record.
+    let _ = scrape(port).await;
+    let text = scrape(port).await;
+
+    assert_eq!(series(&text, "witness_requests_total{cache=\"miss\"}"), 2.0);
+    assert_eq!(series(&text, "witness_requests_total{cache=\"hit\"}"), 1.0);
+    assert_eq!(
+        series(&text, "witness_requests_total{cache=\"replay\"}"),
+        0.0
+    );
+    assert_eq!(series(&text, "witness_requests_signed_total"), 1.0);
+    assert_eq!(series(&text, "witness_journal_records"), 3.0);
+    assert_eq!(series(&text, "witness_upstream_errors_total"), 0.0);
+    assert_eq!(series(&text, "witness_request_duration_seconds_count"), 3.0);
+    assert!(series(&text, "witness_request_duration_seconds_sum") > 0.0);
+    // Cumulative buckets: the +Inf bucket holds every observation.
+    assert_eq!(
+        series(
+            &text,
+            "witness_request_duration_seconds_bucket{le=\"+Inf\"}"
+        ),
+        3.0
+    );
+    assert!(
+        series(&text, "witness_request_duration_seconds_bucket{le=\"30\"}")
+            <= series(
+                &text,
+                "witness_request_duration_seconds_bucket{le=\"+Inf\"}"
+            )
+    );
+
+    // The introspection path is excluded from recording, not merely ignored.
+    let records = Journal::read_all_from(&dir.join("journal.log")).unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(records.iter().all(|r| !r.path.contains("witness/metrics")));
+
+    // A replay instance counts its own disposition.
+    let replay_dir = dir.clone();
+    tokio::spawn(async move {
+        proxy::serve(proxy::Options {
+            port: replay_port,
+            upstream: "replay://".into(),
+            data_dir: replay_dir,
+            mode: proxy::Mode::Open,
+            trust: Vec::new(),
+            cache: true,
+            replay: true,
+            otlp_endpoint: None,
+        })
+        .await
+        .unwrap();
+    });
+    wait_for(replay_port).await;
+    assert_eq!(
+        post(replay_port, &b, vec![]).await.2.as_deref(),
+        Some("replay")
+    );
+    let text = scrape(replay_port).await;
+    assert_eq!(
+        series(&text, "witness_requests_total{cache=\"replay\"}"),
+        1.0
+    );
+    assert_eq!(series(&text, "witness_requests_total{cache=\"hit\"}"), 0.0);
+    assert_eq!(series(&text, "witness_journal_records"), 4.0);
+
+    // An unreachable upstream is a counted error, not a silent 502.
+    tokio::spawn(async move {
+        proxy::serve(proxy::Options {
+            port: dead_port,
+            upstream: format!("http://127.0.0.1:{unbound_port}"),
+            data_dir: dead_dir,
+            mode: proxy::Mode::Open,
+            trust: Vec::new(),
+            cache: false,
+            replay: false,
+            otlp_endpoint: None,
+        })
+        .await
+        .unwrap();
+    });
+    wait_for(dead_port).await;
+    assert_eq!(post(dead_port, &b, vec![]).await.0, 502);
+    let text = scrape(dead_port).await;
+    assert_eq!(series(&text, "witness_upstream_errors_total"), 1.0);
+    assert_eq!(series(&text, "witness_requests_total{cache=\"miss\"}"), 1.0);
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(dir.with_extension("dead")).ok();
+}
+
+/// A stand-in OTLP/HTTP collector: accepts the JSON export and flattens every
+/// span into one list the test can assert on.
+fn otlp_collector(port: u16) -> std::sync::Arc<std::sync::Mutex<Vec<Value>>> {
+    use axum::extract::State;
+    use axum::routing::post as axum_post;
+    use axum::Router;
+
+    let sink: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+    let state = sink.clone();
+    tokio::spawn(async move {
+        let router = Router::new()
+            .route(
+                "/v1/traces",
+                axum_post(
+                    |State(sink): State<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
+                     raw: String| async move {
+                        let parsed: Value = serde_json::from_str(&raw).expect("OTLP body is JSON");
+                        let mut got = sink.lock().unwrap();
+                        for rs in parsed["resourceSpans"].as_array().unwrap() {
+                            for ss in rs["scopeSpans"].as_array().unwrap() {
+                                for span in ss["spans"].as_array().unwrap() {
+                                    got.push(span.clone());
+                                }
+                            }
+                        }
+                        "{}"
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        axum::serve(listener, router).await.unwrap();
+    });
+    sink
+}
+
+async fn wait_for_spans(
+    sink: &std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    want: usize,
+) -> Vec<Value> {
+    for _ in 0..200 {
+        {
+            let got = sink.lock().unwrap();
+            if got.len() >= want {
+                return got.clone();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "only {} of {want} spans arrived",
+        sink.lock().unwrap().len()
+    );
+}
+
+fn attr<'a>(span: &'a Value, key: &str) -> &'a Value {
+    span["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["key"] == key)
+        .unwrap_or_else(|| panic!("span has no attribute {key}: {span}"))
+}
+
+fn string_attr(span: &Value, key: &str) -> String {
+    attr(span, key)["value"]["stringValue"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn otlp_projection_emits_genai_spans() {
+    let dir = std::env::temp_dir().join(format!("witness-e2e-otlp-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+
+    let mock_port = 39740;
+    let port = 39741;
+    let collector_port = 39742;
+
+    let sink = otlp_collector(collector_port);
+    tokio::spawn(mock::serve(mock_port, 0));
+    let proxy_dir = dir.clone();
+    tokio::spawn(async move {
+        proxy::serve(proxy::Options {
+            port,
+            upstream: format!("http://127.0.0.1:{mock_port}"),
+            data_dir: proxy_dir,
+            mode: proxy::Mode::Open,
+            trust: Vec::new(),
+            cache: true,
+            replay: false,
+            // Base URL only: the exporter appends the /v1/traces signal path.
+            otlp_endpoint: Some(format!("http://127.0.0.1:{collector_port}")),
+        })
+        .await
+        .unwrap();
+    });
+    wait_for(mock_port).await;
+    wait_for(port).await;
+    wait_for(collector_port).await;
+
+    let b = body("otlp lemma", "claude-sonnet-5");
+    assert_eq!(post(port, &b, vec![]).await.2.as_deref(), Some("miss"));
+    assert_eq!(post(port, &b, vec![]).await.2.as_deref(), Some("hit"));
+
+    let spans = wait_for_spans(&sink, 2).await;
+    let records = Journal::read_all_from(&dir.join("journal.log")).unwrap();
+    assert_eq!(records.len(), 2);
+
+    for span in &spans {
+        assert_eq!(span["name"], "chat claude-sonnet-5");
+        assert_eq!(span["kind"], 3, "SPAN_KIND_CLIENT");
+        assert_eq!(span["status"]["code"], 1, "STATUS_CODE_OK");
+        assert_eq!(span["traceId"].as_str().unwrap().len(), 32);
+        assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
+        assert!(
+            span["endTimeUnixNano"].as_str().unwrap()
+                >= span["startTimeUnixNano"].as_str().unwrap()
+        );
+
+        assert_eq!(string_attr(span, "gen_ai.operation.name"), "chat");
+        assert_eq!(string_attr(span, "gen_ai.request.model"), "claude-sonnet-5");
+        // Localhost mock is not a known vendor, so semconv's open-enum fallback.
+        assert_eq!(string_attr(span, "gen_ai.system"), "_OTHER");
+        assert_eq!(string_attr(span, "witness.agent"), "anonymous");
+        assert_eq!(string_attr(span, "witness.req_hash").len(), 64);
+        assert_eq!(string_attr(span, "witness.resp_hash").len(), 64);
+
+        // Every span points at a real journal record with the same disposition.
+        let seq: u64 = attr(span, "witness.seq")["value"]["intValue"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let record = records.iter().find(|r| r.seq == seq).expect("known seq");
+        assert_eq!(record.cache, string_attr(span, "witness.cache"));
+        assert_eq!(record.req, string_attr(span, "witness.req_hash"));
+        assert_eq!(record.resp, string_attr(span, "witness.resp_hash"));
+    }
+
+    let dispositions: Vec<String> = spans
+        .iter()
+        .map(|s| string_attr(s, "witness.cache"))
+        .collect();
+    assert!(dispositions.contains(&"miss".to_string()));
+    assert!(dispositions.contains(&"hit".to_string()));
+    assert_ne!(spans[0]["traceId"], spans[1]["traceId"]);
+
+    let text = scrape(port).await;
+    assert!(series(&text, "witness_otlp_spans_exported_total") >= 2.0);
+    assert_eq!(series(&text, "witness_otlp_spans_dropped_total"), 0.0);
 
     std::fs::remove_dir_all(&dir).ok();
 }

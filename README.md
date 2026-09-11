@@ -69,6 +69,34 @@ Every response carries `x-witness-seq`, `x-witness-req`, `x-witness-resp` (BLAKE
 
 LLM calls are nondeterministic. Everything is **recorded**, but a response is only **reused** when that's semantically sound: `temperature: 0`, an explicit `seed`, or the caller opting in with `x-witness-cache: allow`. Replay mode reuses everything — that's its point.
 
+## Observability
+
+Two optional projections of the same record. The journal stays the source of truth; both of these exist so witness can feed the monitoring stack you already run.
+
+**Prometheus.** The proxy exposes its own counters at `GET /witness/metrics` in text exposition format, hand-written, with no client library and no added dependency. That path is a route rather than a branch inside the proxy handler, so it is never forwarded upstream and never journaled.
+
+```
+witness_requests_total{cache="hit|miss|replay"}   counter
+witness_requests_signed_total                     counter    requests with a verified Pact signature
+witness_journal_records                           gauge      current journal length
+witness_upstream_errors_total                     counter    transport failures, unreadable bodies, truncated streams
+witness_otlp_spans_exported_total                 counter
+witness_otlp_spans_dropped_total                  counter    backpressure or a failed export
+witness_request_duration_seconds                  histogram  15 buckets, 0.0005s to 30s
+```
+
+The counters are process-local and reset when the proxy restarts. `witness_journal_records` is the durable one: it reads the journal's sequence number, so it carries across restarts.
+
+**OpenTelemetry.** `--otlp-endpoint` also projects every recorded call onto a GenAI span.
+
+```bash
+witness serve --cache --otlp-endpoint http://127.0.0.1:4318
+```
+
+Spans go out as OTLP/HTTP with a JSON body. A base URL gets `/v1/traces` appended; a full traces URL is used as given. Each span is named `chat <model>` and carries the GenAI semantic convention attributes `gen_ai.system`, `gen_ai.request.model` and `gen_ai.operation.name`, plus `witness.seq`, `witness.cache`, `witness.req_hash`, `witness.resp_hash` and `witness.agent`, which tie the span back to the journal record and to the exact bytes in the CAS.
+
+Honest scope: this projection is minimal by design. The JSON is built by hand, none of the `opentelemetry` crates are pulled in, and a single background task drains a bounded channel. There is no context propagation, no sampling and no retry, so every span is its own root trace, and under backpressure spans are dropped and counted rather than allowed to slow the request path. If you want a real tracing pipeline, instrument your agent framework; use this to get witness's cache and provenance data onto a dashboard you already have.
+
 ## Overhead (measured, not claimed)
 
 `bench/bench.sh` (needs [oha](https://github.com/hatoo/oha)) runs the mock upstream at `--latency-ms 0` so witness's own cost isn't hidden behind simulated inference. Four scenarios isolate each layer; numbers below are the median of 3 runs at n=2000, c=20 on an M-series MacBook:

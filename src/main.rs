@@ -40,11 +40,18 @@ enum Command {
         /// Enable cache reuse for deterministic requests (recording always happens).
         #[arg(long)]
         cache: bool,
+        /// Also project each recorded call onto an OpenTelemetry GenAI span,
+        /// posted to this OTLP/HTTP collector (e.g. http://127.0.0.1:4318).
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
     },
     /// Serve strictly from the recorded run — zero upstream calls.
     Replay {
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// OTLP/HTTP collector for GenAI spans, as in `serve`.
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
     },
     /// Run a fake Anthropic-shaped upstream for demos and tests.
     Mock {
@@ -163,6 +170,7 @@ async fn main() -> Result<()> {
             mode,
             trust,
             cache,
+            otlp_endpoint,
         } => {
             let mode = match mode.as_str() {
                 "open" => proxy::Mode::Open,
@@ -178,10 +186,14 @@ async fn main() -> Result<()> {
                 trust,
                 cache,
                 replay: false,
+                otlp_endpoint,
             })
             .await
         }
-        Command::Replay { port } => {
+        Command::Replay {
+            port,
+            otlp_endpoint,
+        } => {
             proxy::serve(proxy::Options {
                 port,
                 upstream: "replay://".into(),
@@ -190,6 +202,7 @@ async fn main() -> Result<()> {
                 trust: Vec::new(),
                 cache: true,
                 replay: true,
+                otlp_endpoint,
             })
             .await
         }
