@@ -13,9 +13,15 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$REPO/target/release/witness"
+BIN="${BIN:-$REPO/target/release/witness}"
 N="${N:-2000}"        # requests per scenario
 C="${C:-20}"          # concurrent connections
+# Three consecutive ports from here. Override to compare two builds side by
+# side, or when something else already owns 9800.
+BASE_PORT="${BASE_PORT:-9800}"
+MOCK_PORT=$BASE_PORT
+REC_PORT=$((BASE_PORT + 1))
+HIT_PORT=$((BASE_PORT + 2))
 [ -x "$BIN" ] || { echo "build first: cargo build --release" >&2; exit 1; }
 command -v oha >/dev/null || { echo "install oha: brew install oha" >&2; exit 1; }
 
@@ -28,11 +34,11 @@ cd "$WORK"
 BODY='{"model":"claude-sonnet-5","max_tokens":64,"temperature":0,"messages":[{"role":"user","content":"benchmark request"}]}'
 printf '%s' "$BODY" > body.json
 
-"$BIN" mock --port 9800 --latency-ms 0 >/dev/null 2>&1 &
+"$BIN" mock --port "$MOCK_PORT" --latency-ms 0 >/dev/null 2>&1 &
 PIDS="$PIDS $!"
-"$BIN" --data-dir rec  serve --port 9801 --upstream http://127.0.0.1:9800 >/dev/null 2>&1 &
+"$BIN" --data-dir rec  serve --port "$REC_PORT" --upstream "http://127.0.0.1:$MOCK_PORT" >/dev/null 2>&1 &
 PIDS="$PIDS $!"
-"$BIN" --data-dir hit  serve --port 9802 --upstream http://127.0.0.1:9800 --cache >/dev/null 2>&1 &
+"$BIN" --data-dir hit  serve --port "$HIT_PORT" --upstream "http://127.0.0.1:$MOCK_PORT" --cache >/dev/null 2>&1 &
 PIDS="$PIDS $!"
 sleep 1
 
@@ -46,7 +52,7 @@ while IFS= read -r h; do
 done < <("$BIN" sign --key agent --chain chain.json --body-file body.json)
 
 # Warm the cache scenario so every measured request is a hit.
-curl -s -X POST -H 'content-type: application/json' -d "$BODY" http://127.0.0.1:9802/v1/messages >/dev/null
+curl -s -X POST -H 'content-type: application/json' -d "$BODY" "http://127.0.0.1:$HIT_PORT/v1/messages" >/dev/null
 
 run() { # name, url, extra args...
   local name="$1" url="$2"; shift 2
@@ -63,9 +69,9 @@ run() { # name, url, extra args...
 
 echo "witness bench — n=$N c=$C, mock latency 0ms, $(uname -sm)"
 echo
-run "direct"      http://127.0.0.1:9800/v1/messages
-run "record"      http://127.0.0.1:9801/v1/messages
-run "record+sign" http://127.0.0.1:9801/v1/messages "${SIGN_ARGS[@]}"
-run "cache-hit"   http://127.0.0.1:9802/v1/messages
+run "direct"      "http://127.0.0.1:$MOCK_PORT/v1/messages"
+run "record"      "http://127.0.0.1:$REC_PORT/v1/messages"
+run "record+sign" "http://127.0.0.1:$REC_PORT/v1/messages" "${SIGN_ARGS[@]}"
+run "cache-hit"   "http://127.0.0.1:$HIT_PORT/v1/messages"
 echo
 echo "journal records written: rec=$("$BIN" --data-dir rec stats | awk '/^records/{print $2}')"
