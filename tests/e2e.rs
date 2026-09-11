@@ -647,6 +647,116 @@ async fn otlp_projection_emits_genai_spans() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The thesis, end to end: a response nobody would reuse on sampling grounds
+/// becomes reusable once an external check vouches for it. The temperature
+/// never changes; only what is known about the answer does.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_attestation_unlocks_a_nondeterministic_request() {
+    let dir = std::env::temp_dir().join(format!("witness-e2e-oracle-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let mock_port = 39820;
+    let port = 39821;
+
+    tokio::spawn(mock::serve(mock_port, 0));
+    let proxy_dir = dir.clone();
+    tokio::spawn(async move {
+        proxy::serve(proxy::Options {
+            port,
+            upstream: format!("http://127.0.0.1:{mock_port}"),
+            data_dir: proxy_dir,
+            mode: proxy::Mode::Open,
+            trust: Vec::new(),
+            cache: true,
+            replay: false,
+            otlp_endpoint: None,
+            peers: Vec::new(),
+            peer_token: None,
+        })
+        .await
+        .unwrap();
+    });
+    wait_for(mock_port).await;
+    wait_for(port).await;
+
+    // temperature 1: recorded, never reused, however often it is asked.
+    let mut hot = body("attest this sampled answer", "claude-sonnet-5");
+    hot["temperature"] = json!(1.0);
+    let (status, first, cache) = post(port, &hot, vec![]).await;
+    assert_eq!(status, 200);
+    assert_eq!(cache.as_deref(), Some("miss"));
+    assert_eq!(post(port, &hot, vec![]).await.2.as_deref(), Some("miss"));
+
+    // An oracle reads the recorded response body and exits 0.
+    let attestation = witness::oracle::attest(witness::oracle::AttestOptions {
+        data_dir: &dir,
+        seq: 1,
+        oracle: "grep -q mock",
+        name: "grep",
+        key: None,
+        method: witness::oracle::DEFAULT_METHOD,
+    })
+    .unwrap();
+    assert!(attestation.verified, "the mock's text contains \"mock\"");
+
+    // Same body, same temperature, now served from the record.
+    let (status, third, cache) = post(port, &hot, vec![]).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        cache.as_deref(),
+        Some("hit"),
+        "an attested request is reusable whatever its sampling parameters"
+    );
+    assert_eq!(third, first, "the hit must be the attested bytes");
+
+    // A different nondeterministic request is untouched by that attestation.
+    let mut other = body("some other sampled answer", "claude-sonnet-5");
+    other["temperature"] = json!(1.0);
+    assert_eq!(post(port, &other, vec![]).await.2.as_deref(), Some("miss"));
+    assert_eq!(post(port, &other, vec![]).await.2.as_deref(), Some("miss"));
+
+    // The attestation is in the same chain, naming the command that vouched.
+    let records = Journal::read_all_from(&dir.join("journal.log")).unwrap();
+    Journal::verify_chain(&records).unwrap();
+    let attest_record = records
+        .iter()
+        .find(|r| r.path == "attest:grep:1")
+        .expect("attestation is journaled");
+    assert_eq!(attest_record.seq, attestation.seq.unwrap());
+    assert_eq!(attest_record.req, records[0].hash);
+    let cas = witness::cas::Cas::open(&dir).unwrap();
+    let evidence: Value =
+        serde_json::from_slice(&cas.get(&attest_record.resp).unwrap().unwrap()).unwrap();
+    assert_eq!(evidence["oracle"], "grep -q mock");
+    assert_eq!(evidence["req_key"], attestation.req_key);
+
+    // And the marker the proxy consulted is listed for an operator.
+    let markers = witness::oracle::list(&dir).unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].req_key, attestation.req_key);
+
+    // A refuted oracle over that same record leaves the journal untouched.
+    let before = records.len();
+    let refuted = witness::oracle::attest(witness::oracle::AttestOptions {
+        data_dir: &dir,
+        seq: 1,
+        oracle: "grep -q 'this string is not in any mock response'",
+        name: "grep",
+        key: None,
+        method: witness::oracle::DEFAULT_METHOD,
+    })
+    .unwrap();
+    assert!(!refuted.verified);
+    assert_eq!(
+        Journal::read_all_from(&dir.join("journal.log"))
+            .unwrap()
+            .len(),
+        before,
+        "a refutation must not append a record"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // --- fleet mode v1: squid-sibling peer cache ---------------------------------
 //
 // Ports for these tests come from the 39840-39869 block. The `dead_*` ports are
@@ -662,6 +772,11 @@ const TOKEN_MOCK_PORT: u16 = 39850;
 const TOKEN_A_PORT: u16 = 39851;
 const TOKEN_B_PORT: u16 = 39852;
 const TOKEN_DEAD_UPSTREAM: u16 = 39859;
+
+const ATTEST_MOCK_PORT: u16 = 39843;
+const ATTEST_A_PORT: u16 = 39844;
+const ATTEST_B_PORT: u16 = 39845;
+const ATTEST_DEAD_UPSTREAM: u16 = 39848;
 
 const SLOW_MOCK_PORT: u16 = 39860;
 const SLOW_PROXY_PORT: u16 = 39861;
@@ -919,4 +1034,96 @@ async fn a_dead_peer_does_not_stall_the_request() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Where fleet mode and verifier oracles meet. A peer is asked under exactly
+/// the condition that would have allowed a local hit, and since the oracle
+/// work landed that condition includes an attestation. A temperature 1.0
+/// request therefore gets no peer lookup at all until this instance has an
+/// attestation for it, and then the sibling can answer it.
+///
+/// The marker is written directly rather than through `witness attest`,
+/// because the case being pinned is the one where a marker exists here and
+/// the object does not: attested earlier, pruned since, still held next door.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attested_request_is_worth_asking_a_peer_for() {
+    let dir_a = std::env::temp_dir().join(format!("witness-e2e-fleetatt-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("witness-e2e-fleetatt-b-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir_a).ok();
+    std::fs::remove_dir_all(&dir_b).ok();
+
+    tokio::spawn(mock::serve(ATTEST_MOCK_PORT, 0));
+    fleet_instance(ATTEST_A_PORT, &dir_a, ATTEST_MOCK_PORT, Vec::new(), None);
+    fleet_instance(
+        ATTEST_B_PORT,
+        &dir_b,
+        ATTEST_DEAD_UPSTREAM,
+        vec![peer_url(ATTEST_A_PORT)],
+        None,
+    );
+    wait_for(ATTEST_MOCK_PORT).await;
+    wait_for(ATTEST_A_PORT).await;
+    wait_for(ATTEST_B_PORT).await;
+
+    // A records a sampled answer. Recording is unconditional, so A holds the
+    // bytes even though nothing would reuse them yet.
+    let mut hot = body("fleet lemma F4", "claude-sonnet-5");
+    hot["temperature"] = json!(1.0);
+    let (status, recorded, cache) = post(ATTEST_A_PORT, &hot, vec![]).await;
+    assert_eq!(status, 200);
+    assert_eq!(cache.as_deref(), Some("miss"));
+
+    // B will not spend a peer lookup on a request it could not reuse anyway.
+    let (status, _, _) = post(ATTEST_B_PORT, &hot, vec![]).await;
+    assert_eq!(
+        status, 502,
+        "B's upstream is dead and nothing else may serve it"
+    );
+    let text = scrape(ATTEST_B_PORT).await;
+    assert_eq!(
+        series(&text, "witness_peer_errors_total"),
+        0.0,
+        "a nondeterministic request must not even reach the peers"
+    );
+    assert_eq!(series(&text, "witness_peer_hits_total"), 0.0);
+
+    // An oracle vouches for this exact request on this instance.
+    let req_key = witness::hash::request_key("POST", "/v1/messages", hot.to_string().as_bytes());
+    let attested = witness::oracle::attested_dir(&dir_b);
+    std::fs::create_dir_all(&attested).unwrap();
+    std::fs::write(
+        attested.join(&req_key),
+        serde_json::to_vec(&witness::oracle::Marker {
+            req_key: req_key.clone(),
+            name: "grep".into(),
+            seq: 0,
+            target_seq: 0,
+            attester: witness::oracle::ANONYMOUS_ATTESTER.into(),
+            ts_ms: now_ms(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Same body, same temperature, and now worth asking the sibling for.
+    let (status, from_peer, cache) = post(ATTEST_B_PORT, &hot, vec![]).await;
+    assert_eq!(status, 200);
+    assert_eq!(cache.as_deref(), Some("peer"));
+    assert_eq!(from_peer, recorded);
+
+    let records = Journal::read_all_from(&dir_b.join("journal.log")).unwrap();
+    Journal::verify_chain(&records).unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "the 502 journaled nothing; the peer hit did"
+    );
+    assert_eq!(records[0].cache, "peer");
+    assert_eq!(
+        records[0].upstream,
+        format!("peer:127.0.0.1:{ATTEST_A_PORT}")
+    );
+
+    std::fs::remove_dir_all(&dir_a).ok();
+    std::fs::remove_dir_all(&dir_b).ok();
 }

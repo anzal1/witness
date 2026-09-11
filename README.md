@@ -194,6 +194,29 @@ Stated plainly, because the gaps matter more than the feature list:
 
 LLM calls are nondeterministic. Everything is **recorded**, but a response is only **reused** when that's semantically sound: `temperature: 0`, an explicit `seed`, or the caller opting in with `x-witness-cache: allow`. Replay mode reuses everything — that's its point.
 
+### Verifier oracles
+
+There is a fourth way to earn reuse, and it does not look at the sampling parameters at all. If something outside witness has checked the answer and found it good, the answer is good. A verified result does not care what temperature produced it.
+
+`witness attest` runs a command of your choosing over a recorded response body and treats its exit status as the verdict:
+
+```bash
+# seq 1 was a temperature 1.0 call: recorded, never reused
+witness attest --seq 1 --oracle 'pytest -q' --name pytest
+witness attest --seq 1 --oracle 'lake env lean Proof.lean' --name lean
+witness attest --seq 1 --oracle 'jq -e .content[0].text' --name schema
+
+witness attested          # seq, name, req_key for every attested request
+```
+
+The response body arrives on the command's stdin. Exit 0 verifies, anything else refutes. A refuted attestation writes nothing at all: no marker, no journal record, and the command's own exit status comes back out of `witness attest` so a script can branch on it. A verified one does two things. It appends a record to the same hash chain, whose `path` is `attest:<name>:<target seq>`, whose `req` is the attested record's chain hash, and whose `resp` resolves in the CAS to the exact command, exit status and stdout that vouched for it. And it writes a marker under `<data-dir>/attested/<request key>`, which the proxy stats before its sampling checks. From then on that one request is served from the record regardless of its temperature.
+
+Scope is one request, not one prompt and not one model. The marker is keyed by the cache key of the exact request that was attested: method, path, and canonical request body. Change a single token of the prompt and you are back to a miss, because you are asking a different question and nothing has verified the answer to it.
+
+**The trust model, stated plainly.** An oracle attestation is worth exactly as much as the oracle command. `--oracle true` will happily attest anything, and witness will not stop you. What witness does instead is refuse to let that be invisible: the command string, the target record, the exit status and the output all go into the journal, under the same Merkle commitments and the same Rekor anchor as everything else. An auditor does not have to take "verified" on faith. They can read which command vouched for which response, and decide for themselves whether that command was worth believing. The signature from `--key` says who ran the oracle, not that the oracle was any good.
+
+One operational note: `witness attest` appends through its own handle while a proxy may be serving. A handle re-reads the chain tip when the file has grown beneath it, so attesting a live journal is safe. The journal still expects one hot writer per data directory; two proxies on one data dir was never supported and still is not.
+
 ## Fleet mode v1 (peer cache)
 
 Many witness instances, one warm cache. On a local miss, an instance asks its siblings for that exact request key before it pays the upstream. This is squid sibling behaviour: no central node, no consistent hashing, no cluster membership, no service discovery. Each instance is told who its peers are, and asks them in order.
@@ -227,10 +250,10 @@ Stated plainly, because this is a v1 and the gaps are the interesting part:
 - **Journals stay per-instance.** Each instance is its own witness with its own hash chain, and adopting a sibling's bytes does not adopt its record. A fleet-wide audit means verifying and reading N journals. It is also why the record says `peer:<host:port>`: a call inherited from a sibling never claims to have reached the model.
 - **No membership, health checking or backoff.** A peer that is down is retried on every miss and costs its budget every time.
 - **Pull only.** Instances never push entries to each other, so a cold instance warms only through the traffic it actually serves.
+- **Oracle attestations do not travel.** An instance reads its own `attested/` markers when it decides whether a request is reusable, so a sibling's verdict does not come along with the sibling's bytes. Attest on each instance that should honour it, or keep a shared data directory out of scope for now.
 - **No compression and no streaming on the peer read.** A recorded SSE response crosses the wire as one body, exactly as a local cache hit replays it.
 
 This partially addresses issue #1; consistent hashing, single-flight across instances and a transport other than plain HTTP are still open.
-
 ## Observability
 
 Two optional projections of the same record. The journal stays the source of truth; both of these exist so witness can feed the monitoring stack you already run.
@@ -332,6 +355,7 @@ agent ──signed request──▶ witness ──▶ model API
                             ├─ objects/   content-addressed bodies
                             ├─ journal.log  hash-chained records
                             ├─ cache/     request-key → response index
+                            ├─ attested/  request keys an oracle vouched for
                             └─ commitments/  Merkle roots + Rekor anchor receipts
 
 Rust, ~2.5k lines: `tokio`/`axum` proxy, a line-streamed stdio MCP wrapper, BLAKE3 hashing (incremental — streams are fingerprinted as they pass through), `ed25519-dalek`, flat-file git-style CAS, JSONL hash-chained journal, hand-rolled Merkle (~100 lines, fully tested). One static binary, no database, no daemon dependencies.
@@ -343,6 +367,7 @@ MCP client ──stdio JSON-RPC──▶ witness mcp   ──▶ MCP server    (
                                     ├─ objects/     content-addressed bodies
                                     ├─ journal.log  one hash chain over both
                                     ├─ cache/       request-key → response index
+                                    ├─ attested/    request keys an oracle vouched for
                                     └─ commitments/ Merkle roots
 ```
 
@@ -351,4 +376,4 @@ MCP client ──stdio JSON-RPC──▶ witness mcp   ──▶ MCP server    (
 - MCP beyond v1: Streamable HTTP transport, recording `resources/*` and `prompts/*`, and Pact identity carried in `_meta` so tool calls are attributed to a key rather than a label
 - Fleet mode beyond v1: consistent hashing so a large fleet does not ask everyone everything, single-flight so concurrent identical misses cost one upstream call, peer health tracking, and a transport that is not one HTTP GET per lookup
 - OpenAI-compatible upstream shapes (`/v1/chat/completions`) — the proxy is path-agnostic today, cache/audit already work
-- Verifier oracles: mark records `verified-by` (test suite, Lean check) to unlock unconditional reuse
+- Oracle policy: attest a *class* of requests (a prompt template, a model, an agent) rather than one exact request, without giving up the audit trail that makes a single attestation legible

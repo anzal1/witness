@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use witness::cas::Cas;
 use witness::identity::{self, Delegation, Keypair};
 use witness::journal::{self, Journal};
-use witness::{agent_record, anchor, client, mcp, merkle, mock, proxy};
+use witness::{agent_record, anchor, client, mcp, merkle, mock, oracle, proxy};
 
 #[derive(Parser)]
 #[command(
@@ -144,6 +144,29 @@ enum Command {
         #[arg(long)]
         cache_opt_in: bool,
     },
+    /// Run an external verifier over a recorded response. On exit 0 the
+    /// attestation is journaled and that request becomes reusable regardless
+    /// of the sampling parameters it was made with.
+    Attest {
+        /// Journal sequence number of the record to verify.
+        #[arg(long)]
+        seq: u64,
+        /// Shell command; the recorded response body arrives on its stdin.
+        /// Exit 0 verifies, any other status refutes.
+        #[arg(long)]
+        oracle: String,
+        /// Label for this oracle, recorded in the journal, e.g. "pytest".
+        #[arg(long, default_value = "oracle")]
+        name: String,
+        /// Key that signs the attested record's chain hash.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Method the original request used, for reconstructing its cache key.
+        #[arg(long, default_value = oracle::DEFAULT_METHOD)]
+        method: String,
+    },
+    /// List the requests a verifier oracle has made unconditionally reusable.
+    Attested,
     /// Verify the journal's hash chain end to end.
     Verify,
     /// Print journal records (newest last).
@@ -402,6 +425,65 @@ async fn main() -> Result<()> {
                 cache_opt_in,
             })
             .await
+        }
+        Command::Attest {
+            seq,
+            oracle: command,
+            name,
+            key,
+            method,
+        } => {
+            let result = oracle::attest(oracle::AttestOptions {
+                data_dir: &data_dir,
+                seq,
+                oracle: &command,
+                name: &name,
+                key: key.as_deref(),
+                method: &method,
+            })?;
+            if !result.verified {
+                // Nothing was written. Say so on stderr and exit with the
+                // oracle's own status, so a script can branch on it.
+                eprintln!(
+                    "REFUTED  seq {} by {name}: `{command}` exited {}\nnothing journaled, nothing attested",
+                    result.target_seq, result.exit_code
+                );
+                std::process::exit(if result.exit_code == 0 {
+                    1
+                } else {
+                    result.exit_code
+                });
+            }
+            println!(
+                "VERIFIED seq {} by {name}  req_key={}",
+                result.target_seq, result.req_key
+            );
+            eprintln!(
+                "attestation recorded as seq {} (attester {}, evidence {})",
+                result.seq.unwrap(),
+                result.attester,
+                result.evidence.as_deref().unwrap_or("-")
+            );
+            eprintln!("this request is now reusable from cache whatever its temperature");
+            Ok(())
+        }
+        Command::Attested => {
+            let markers = oracle::list(&data_dir)?;
+            if markers.is_empty() {
+                println!("no attestations yet: run `witness attest --seq <N> --oracle '<cmd>'`");
+                return Ok(());
+            }
+            for m in &markers {
+                println!(
+                    "#{:<5} {:<16} target={:<5} req_key={}  attester={}",
+                    m.seq,
+                    m.name,
+                    m.target_seq,
+                    m.req_key,
+                    &m.attester[..m.attester.len().min(12)],
+                );
+            }
+            Ok(())
         }
         Command::Verify => {
             let records = Journal::read_all_from(&data_dir.join("journal.log"))?;

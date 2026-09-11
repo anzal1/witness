@@ -78,6 +78,9 @@ struct Inner {
     file: File,
     next_seq: u64,
     prev_hash: String,
+    /// Bytes this handle believes the journal holds. A cheap way to notice
+    /// that someone else appended; see `append_invoke`.
+    written_len: u64,
 }
 
 pub struct Journal {
@@ -89,28 +92,46 @@ impl Journal {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let path = data_dir.join("journal.log");
         std::fs::create_dir_all(data_dir)?;
-        // Recover chain tip by scanning existing records.
-        let (next_seq, prev_hash) = match Self::read_all_from(&path) {
-            Ok(records) => match records.last() {
-                Some(last) => (last.seq + 1, last.hash.clone()),
-                None => (1, ZERO_HASH.to_string()),
-            },
-            Err(_) if !path.exists() => (1, ZERO_HASH.to_string()),
-            Err(e) => return Err(e).context("reading existing journal"),
-        };
+        let (next_seq, prev_hash) = Self::tip(&path)?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let written_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             path,
             inner: Mutex::new(Inner {
                 file,
                 next_seq,
                 prev_hash,
+                written_len,
             }),
         })
     }
 
+    /// Recover the chain tip by scanning existing records.
+    fn tip(path: &Path) -> Result<(u64, String)> {
+        match Self::read_all_from(path) {
+            Ok(records) => Ok(match records.last() {
+                Some(last) => (last.seq + 1, last.hash.clone()),
+                None => (1, ZERO_HASH.to_string()),
+            }),
+            Err(_) if !path.exists() => Ok((1, ZERO_HASH.to_string())),
+            Err(e) => Err(e).context("reading existing journal"),
+        }
+    }
+
     pub fn append_invoke(&self, e: InvokeEntry) -> Result<Record> {
         let mut inner = self.inner.lock().unwrap();
+        // Another process may have appended since this handle cached the tip:
+        // `witness attest` does exactly that while a proxy is serving. One
+        // fstat per append notices it, and only a mismatch pays for a re-read.
+        // This closes the stale-tip case, not a true simultaneous-write race;
+        // the journal is still meant to have one hot writer per data dir.
+        let on_disk = inner.file.metadata().map(|m| m.len()).unwrap_or(0);
+        if on_disk != inner.written_len {
+            let (next_seq, prev_hash) = Self::tip(&self.path)?;
+            inner.next_seq = next_seq;
+            inner.prev_hash = prev_hash;
+            inner.written_len = on_disk;
+        }
         let mut record = Record {
             seq: inner.next_seq,
             ts_ms: now_ms(),
@@ -133,6 +154,7 @@ impl Journal {
         line.push(b'\n');
         inner.file.write_all(&line)?;
         inner.file.flush()?;
+        inner.written_len += line.len() as u64;
         inner.next_seq += 1;
         inner.prev_hash = record.hash.clone();
         Ok(record)
@@ -269,6 +291,35 @@ mod tests {
         assert_eq!(records[1].seq, 2);
         assert_eq!(Journal::verify_chain(&records).unwrap(), 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `witness attest` appends through its own handle while a proxy holds
+    /// one open. A handle that trusted its cached tip would reuse a sequence
+    /// number and break the chain, so it re-reads when the file has grown.
+    #[test]
+    fn a_second_handle_does_not_break_the_chain() {
+        let dir = tmp_dir("two-writers");
+        std::fs::remove_dir_all(&dir).ok();
+        let serving = Journal::open(&dir).unwrap();
+        serving.append_invoke(entry(1)).unwrap();
+
+        // A separate handle, as a separate process would have.
+        let attesting = Journal::open(&dir).unwrap();
+        attesting.append_invoke(entry(2)).unwrap();
+
+        // The first handle's cached tip is now stale; the next append must
+        // pick up where the other writer left off.
+        let third = serving.append_invoke(entry(3)).unwrap();
+        assert_eq!(third.seq, 3);
+
+        let records = journal_records(&dir);
+        assert_eq!(records.len(), 3);
+        assert_eq!(Journal::verify_chain(&records).unwrap(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn journal_records(dir: &Path) -> Vec<Record> {
+        Journal::read_all_from(&dir.join("journal.log")).unwrap()
     }
 
     /// Journals outlive the binary that wrote them, so a record written before
