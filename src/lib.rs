@@ -6,6 +6,7 @@
 //! - AgentReplay: content-addressed recording of every call in a
 //!   hash-chained journal, with deterministic replay and Merkle commitments.
 
+pub mod agent_record;
 pub mod cas;
 pub mod client;
 pub mod hash;
