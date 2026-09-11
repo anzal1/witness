@@ -44,6 +44,14 @@ enum Command {
         /// posted to this OTLP/HTTP collector (e.g. http://127.0.0.1:4318).
         #[arg(long)]
         otlp_endpoint: Option<String>,
+        /// Sibling witness instance to ask on a local cache miss, before the
+        /// upstream. Repeatable, tried in order, 300ms budget each.
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Shared secret for the peer cache route: required on inbound peer
+        /// reads and sent on outbound ones. Unset leaves the route open.
+        #[arg(long)]
+        peer_token: Option<String>,
     },
     /// Serve strictly from the recorded run — zero upstream calls.
     Replay {
@@ -226,6 +234,8 @@ async fn main() -> Result<()> {
             trust,
             cache,
             otlp_endpoint,
+            peers,
+            peer_token,
         } => {
             let mode = match mode.as_str() {
                 "open" => proxy::Mode::Open,
@@ -242,6 +252,8 @@ async fn main() -> Result<()> {
                 cache,
                 replay: false,
                 otlp_endpoint,
+                peers,
+                peer_token,
             })
             .await
         }
@@ -258,6 +270,9 @@ async fn main() -> Result<()> {
                 cache: true,
                 replay: true,
                 otlp_endpoint,
+                // Replay is offline by definition: it ignores the fleet.
+                peers: Vec::new(),
+                peer_token: None,
             })
             .await
         }
@@ -569,6 +584,7 @@ async fn main() -> Result<()> {
             let hits = records.iter().filter(|r| r.cache == "hit").count();
             let replays = records.iter().filter(|r| r.cache == "replay").count();
             let misses = records.iter().filter(|r| r.cache == "miss").count();
+            let peers = records.iter().filter(|r| r.cache == "peer").count();
             let signed = records.iter().filter(|r| r.sig.is_some()).count();
             let agents: std::collections::BTreeSet<_> =
                 records.iter().map(|r| r.agent.as_str()).collect();
@@ -578,6 +594,7 @@ async fn main() -> Result<()> {
                 "hits:     {hits} ({}%)",
                 (hits * 100).checked_div(total).unwrap_or(0)
             );
+            println!("peers:    {peers}");
             println!("replays:  {replays}");
             println!("signed:   {signed}");
             println!("agents:   {}", agents.len());

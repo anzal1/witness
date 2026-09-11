@@ -194,6 +194,43 @@ Stated plainly, because the gaps matter more than the feature list:
 
 LLM calls are nondeterministic. Everything is **recorded**, but a response is only **reused** when that's semantically sound: `temperature: 0`, an explicit `seed`, or the caller opting in with `x-witness-cache: allow`. Replay mode reuses everything — that's its point.
 
+## Fleet mode v1 (peer cache)
+
+Many witness instances, one warm cache. On a local miss, an instance asks its siblings for that exact request key before it pays the upstream. This is squid sibling behaviour: no central node, no consistent hashing, no cluster membership, no service discovery. Each instance is told who its peers are, and asks them in order.
+
+```bash
+# instance A: an ordinary recording proxy whose cache siblings may read
+witness serve --cache --peer-token "$FLEET_TOKEN"
+
+# instance B: the same, plus two siblings to ask before the upstream
+witness serve --cache --peer-token "$FLEET_TOKEN" \
+  --peer http://10.0.1.11:8787 \
+  --peer http://10.0.1.12:8787
+```
+
+`--peer` is repeatable and the order you give is the order they are asked. `--peer-token` is one shared secret used in both directions: required on inbound peer reads, sent on outbound ones. Serving the route and asking peers are independent, so an instance with no `--peer` still answers its siblings.
+
+**The protocol is one route.** `GET /witness/peer/cache/<request key>` returns the stored response body with its original `content-type`, plus `x-witness-status` (the status the upstream actually gave) and `x-witness-resp` (the BLAKE3 hash of the body). A key that is not cached is a plain `404`. Like `/witness/metrics` it is a route rather than a branch inside the proxy handler, so a peer read is never forwarded upstream and never journaled as a model call.
+
+**A peer hit is adopted, not proxied.** The bytes go into the local CAS, the local cache index gets the entry, and the call is journaled locally with `cache: "peer"` and `upstream: "peer:<host:port>"`. The response carries `x-witness-cache: peer`. The next identical request on that instance is an ordinary local hit that touches no one.
+
+**Token model.** The token authenticates the reader and nothing else; content addressing does the rest. A peer's body must hash to the `x-witness-resp` it advertised or the answer is dropped and counted as an error, so a compromised sibling can withhold and can observe which keys you ask for, but it cannot feed a neighbour bytes of its choosing. Without `--peer-token` the route is open to anything that can reach the port, which is only sane on a network you already trust. The token is a secret in a flag, not an identity: it does not say which sibling asked, it is not Pact, and it does not appear in any journal record.
+
+**A dead peer costs 300ms, at most, per lookup.** Each peer gets a 300ms budget covering connect, response and body read. Over budget, unreachable, unauthorized and hash mismatch all count into `witness_peer_errors_total`, and the lookup moves to the next peer and then to the upstream. Peers are consulted only where a local hit would have been allowed anyway: `--cache` on, the request reusable under the policy above, and not replay mode. Replay ignores the fleet completely, because zero network is the whole point of replay.
+
+### What fleet mode v1 does not do
+
+Stated plainly, because this is a v1 and the gaps are the interesting part:
+
+- **No consistent hashing and no sharding.** Every instance asks every peer it was given. That is fine for a handful of siblings and wrong for fifty.
+- **No dedupe of concurrent identical misses.** Two instances that miss on the same request at the same moment both call the upstream. A peer cache shortens the second wave, not the first.
+- **Journals stay per-instance.** Each instance is its own witness with its own hash chain, and adopting a sibling's bytes does not adopt its record. A fleet-wide audit means verifying and reading N journals. It is also why the record says `peer:<host:port>`: a call inherited from a sibling never claims to have reached the model.
+- **No membership, health checking or backoff.** A peer that is down is retried on every miss and costs its budget every time.
+- **Pull only.** Instances never push entries to each other, so a cold instance warms only through the traffic it actually serves.
+- **No compression and no streaming on the peer read.** A recorded SSE response crosses the wire as one body, exactly as a local cache hit replays it.
+
+This partially addresses issue #1; consistent hashing, single-flight across instances and a transport other than plain HTTP are still open.
+
 ## Observability
 
 Two optional projections of the same record. The journal stays the source of truth; both of these exist so witness can feed the monitoring stack you already run.
@@ -201,10 +238,12 @@ Two optional projections of the same record. The journal stays the source of tru
 **Prometheus.** The proxy exposes its own counters at `GET /witness/metrics` in text exposition format, hand-written, with no client library and no added dependency. That path is a route rather than a branch inside the proxy handler, so it is never forwarded upstream and never journaled.
 
 ```
-witness_requests_total{cache="hit|miss|replay"}   counter
+witness_requests_total{cache="hit|miss|peer|replay"}  counter
 witness_requests_signed_total                     counter    requests with a verified Pact signature
 witness_journal_records                           gauge      current journal length
 witness_upstream_errors_total                     counter    transport failures, unreadable bodies, truncated streams
+witness_peer_hits_total                           counter    requests answered from a sibling instance's cache
+witness_peer_errors_total                         counter    peer lookups that failed rather than cleanly missed
 witness_otlp_spans_exported_total                 counter
 witness_otlp_spans_dropped_total                  counter    backpressure or a failed export
 witness_request_duration_seconds                  histogram  15 buckets, 0.0005s to 30s
@@ -310,6 +349,6 @@ MCP client ──stdio JSON-RPC──▶ witness mcp   ──▶ MCP server    (
 ## Roadmap
 
 - MCP beyond v1: Streamable HTTP transport, recording `resources/*` and `prompts/*`, and Pact identity carried in `_meta` so tool calls are attributed to a key rather than a label
-- Fleet mode: shared cache across many witness instances (consistent hashing, gRPC)
+- Fleet mode beyond v1: consistent hashing so a large fleet does not ask everyone everything, single-flight so concurrent identical misses cost one upstream call, peer health tracking, and a transport that is not one HTTP GET per lookup
 - OpenAI-compatible upstream shapes (`/v1/chat/completions`) — the proxy is path-agnostic today, cache/audit already work
 - Verifier oracles: mark records `verified-by` (test suite, Lean check) to unlock unconditional reuse

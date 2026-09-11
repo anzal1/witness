@@ -3,7 +3,7 @@
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use witness::identity::{
     chain_to_b64, sign_request, Delegation, Keypair, HDR_DELEGATION, HDR_IDENTITY, HDR_SIGNATURE,
@@ -102,6 +102,8 @@ async fn full_lifecycle() {
             cache: true,
             replay: false,
             otlp_endpoint: None,
+            peers: Vec::new(),
+            peer_token: None,
         })
         .await
         .unwrap();
@@ -199,6 +201,8 @@ async fn full_lifecycle() {
             cache: true,
             replay: true,
             otlp_endpoint: None,
+            peers: Vec::new(),
+            peer_token: None,
         })
         .await
         .unwrap();
@@ -243,6 +247,8 @@ async fn required_mode_rejects_anonymous() {
             cache: false,
             replay: false,
             otlp_endpoint: None,
+            peers: Vec::new(),
+            peer_token: None,
         })
         .await
         .unwrap();
@@ -285,6 +291,8 @@ async fn concurrent_identical_requests_all_recorded() {
             cache: false, // force the record+forward path every time
             replay: false,
             otlp_endpoint: None,
+            peers: Vec::new(),
+            peer_token: None,
         })
         .await
         .unwrap();
@@ -366,6 +374,8 @@ async fn metrics_endpoint_counts_traffic() {
             cache: true,
             replay: false,
             otlp_endpoint: None,
+            peers: Vec::new(),
+            peer_token: None,
         })
         .await
         .unwrap();
@@ -431,6 +441,8 @@ async fn metrics_endpoint_counts_traffic() {
             cache: true,
             replay: true,
             otlp_endpoint: None,
+            peers: Vec::new(),
+            peer_token: None,
         })
         .await
         .unwrap();
@@ -459,6 +471,8 @@ async fn metrics_endpoint_counts_traffic() {
             cache: false,
             replay: false,
             otlp_endpoint: None,
+            peers: Vec::new(),
+            peer_token: None,
         })
         .await
         .unwrap();
@@ -569,6 +583,8 @@ async fn otlp_projection_emits_genai_spans() {
             replay: false,
             // Base URL only: the exporter appends the /v1/traces signal path.
             otlp_endpoint: Some(format!("http://127.0.0.1:{collector_port}")),
+            peers: Vec::new(),
+            peer_token: None,
         })
         .await
         .unwrap();
@@ -627,6 +643,280 @@ async fn otlp_projection_emits_genai_spans() {
     let text = scrape(port).await;
     assert!(series(&text, "witness_otlp_spans_exported_total") >= 2.0);
     assert_eq!(series(&text, "witness_otlp_spans_dropped_total"), 0.0);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- fleet mode v1: squid-sibling peer cache ---------------------------------
+//
+// Ports for these tests come from the 39840-39869 block. The `dead_*` ports are
+// never bound by anything: they are how an instance is given an upstream or a
+// peer that cannot answer.
+
+const FLEET_MOCK_PORT: u16 = 39840;
+const FLEET_A_PORT: u16 = 39841;
+const FLEET_B_PORT: u16 = 39842;
+const FLEET_DEAD_UPSTREAM: u16 = 39849;
+
+const TOKEN_MOCK_PORT: u16 = 39850;
+const TOKEN_A_PORT: u16 = 39851;
+const TOKEN_B_PORT: u16 = 39852;
+const TOKEN_DEAD_UPSTREAM: u16 = 39859;
+
+const SLOW_MOCK_PORT: u16 = 39860;
+const SLOW_PROXY_PORT: u16 = 39861;
+const DEAD_PEER_PORT: u16 = 39869;
+
+/// A witness instance for the fleet tests. Everything not named is the
+/// recording default: open mode, cache on, no OTLP.
+fn fleet_instance(
+    port: u16,
+    dir: &std::path::Path,
+    upstream: u16,
+    peers: Vec<String>,
+    peer_token: Option<String>,
+) {
+    let data_dir = dir.to_path_buf();
+    tokio::spawn(async move {
+        proxy::serve(proxy::Options {
+            port,
+            upstream: format!("http://127.0.0.1:{upstream}"),
+            data_dir,
+            mode: proxy::Mode::Open,
+            trust: Vec::new(),
+            cache: true,
+            replay: false,
+            otlp_endpoint: None,
+            peers,
+            peer_token,
+        })
+        .await
+        .unwrap();
+    });
+}
+
+fn peer_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Raw GET against an instance's peer cache route, bypassing the proxy path.
+async fn peer_read(port: u16, req_key: &str, token: Option<&str>) -> (u16, Option<String>, String) {
+    let mut req = reqwest::Client::new().get(format!(
+        "http://127.0.0.1:{port}{}{req_key}",
+        witness::proxy::PEER_CACHE_PREFIX
+    ));
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let resp_hash = resp
+        .headers()
+        .get("x-witness-resp")
+        .map(|v| v.to_str().unwrap().to_string());
+    (status, resp_hash, resp.text().await.unwrap())
+}
+
+/// Instance B answers out of instance A's cache. B's upstream is an unbound
+/// port, so a peer miss could only produce a 502: a 200 here cannot have come
+/// from anywhere but the sibling.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_cache_answers_without_any_upstream() {
+    let dir_a = std::env::temp_dir().join(format!("witness-e2e-fleet-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("witness-e2e-fleet-b-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir_a).ok();
+    std::fs::remove_dir_all(&dir_b).ok();
+
+    tokio::spawn(mock::serve(FLEET_MOCK_PORT, 0));
+    fleet_instance(FLEET_A_PORT, &dir_a, FLEET_MOCK_PORT, Vec::new(), None);
+    wait_for(FLEET_MOCK_PORT).await;
+    wait_for(FLEET_A_PORT).await;
+
+    // A warms the entry against the real (mock) upstream.
+    let b = body("fleet lemma F1", "claude-sonnet-5");
+    let (status, warmed, cache) = post(FLEET_A_PORT, &b, vec![]).await;
+    assert_eq!(status, 200);
+    assert_eq!(cache.as_deref(), Some("miss"));
+
+    // B has a dead upstream and one peer: A.
+    fleet_instance(
+        FLEET_B_PORT,
+        &dir_b,
+        FLEET_DEAD_UPSTREAM,
+        vec![peer_url(FLEET_A_PORT)],
+        None,
+    );
+    wait_for(FLEET_B_PORT).await;
+
+    let (status, from_peer, cache) = post(FLEET_B_PORT, &b, vec![]).await;
+    assert_eq!(status, 200, "B must be served by its peer: {from_peer}");
+    assert_eq!(cache.as_deref(), Some("peer"));
+    assert_eq!(
+        from_peer, warmed,
+        "a peer hit is byte-identical to the record"
+    );
+
+    // B journals the call as its own, naming the sibling it inherited it from.
+    let records = Journal::read_all_from(&dir_b.join("journal.log")).unwrap();
+    Journal::verify_chain(&records).unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "one local record for the peer-served call"
+    );
+    assert_eq!(records[0].cache, "peer");
+    assert_eq!(
+        records[0].upstream,
+        format!("peer:127.0.0.1:{FLEET_A_PORT}")
+    );
+    assert_eq!(records[0].status, 200);
+    assert_eq!(records[0].model.as_deref(), Some("claude-sonnet-5"));
+
+    // The bytes landed in B's own CAS, so B is a witness in its own right.
+    let cas_b = witness::cas::Cas::open(&dir_b).unwrap();
+    assert_eq!(
+        cas_b.get(&records[0].resp).unwrap().unwrap(),
+        warmed.to_string().into_bytes()
+    );
+
+    let text = scrape(FLEET_B_PORT).await;
+    assert_eq!(series(&text, "witness_requests_total{cache=\"peer\"}"), 1.0);
+    assert_eq!(series(&text, "witness_peer_hits_total"), 1.0);
+    assert_eq!(series(&text, "witness_peer_errors_total"), 0.0);
+    assert_eq!(series(&text, "witness_upstream_errors_total"), 0.0);
+    assert_eq!(series(&text, "witness_requests_total{cache=\"miss\"}"), 0.0);
+
+    // The peer answer was adopted, not proxied: the repeat is a local hit and
+    // never touches A again.
+    let (status, again, cache) = post(FLEET_B_PORT, &b, vec![]).await;
+    assert_eq!(status, 200);
+    assert_eq!(cache.as_deref(), Some("hit"));
+    assert_eq!(again, warmed);
+
+    // Serving a peer read is not a model call: A's journal is untouched by it.
+    let records_a = Journal::read_all_from(&dir_a.join("journal.log")).unwrap();
+    assert_eq!(records_a.len(), 1, "A journals only its own upstream call");
+    assert!(records_a.iter().all(|r| !r.path.contains("witness/peer")));
+
+    std::fs::remove_dir_all(&dir_a).ok();
+    std::fs::remove_dir_all(&dir_b).ok();
+}
+
+/// The peer token is a real boundary. A mismatched token is a 401 on the wire,
+/// which the client counts as a peer error and steps past, straight into an
+/// upstream that cannot answer, so the call fails rather than silently
+/// succeeding through an unauthenticated path.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_token_mismatch_is_an_error_not_a_hit() {
+    let dir_a = std::env::temp_dir().join(format!("witness-e2e-token-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("witness-e2e-token-b-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir_a).ok();
+    std::fs::remove_dir_all(&dir_b).ok();
+
+    tokio::spawn(mock::serve(TOKEN_MOCK_PORT, 0));
+    fleet_instance(
+        TOKEN_A_PORT,
+        &dir_a,
+        TOKEN_MOCK_PORT,
+        Vec::new(),
+        Some("fleet-secret".into()),
+    );
+    wait_for(TOKEN_MOCK_PORT).await;
+    wait_for(TOKEN_A_PORT).await;
+
+    let b = body("fleet lemma F2", "claude-sonnet-5");
+    let (status, warmed, _) = post(TOKEN_A_PORT, &b, vec![]).await;
+    assert_eq!(status, 200);
+
+    // The route itself: unauthenticated and wrong-token reads are refused,
+    // the right token gets the recorded bytes.
+    let req_key = witness::hash::request_key("POST", "/v1/messages", b.to_string().as_bytes());
+    assert_eq!(peer_read(TOKEN_A_PORT, &req_key, None).await.0, 401);
+    assert_eq!(
+        peer_read(TOKEN_A_PORT, &req_key, Some("not-the-secret"))
+            .await
+            .0,
+        401
+    );
+    let (status, resp_hash, text) = peer_read(TOKEN_A_PORT, &req_key, Some("fleet-secret")).await;
+    assert_eq!(status, 200);
+    assert_eq!(resp_hash.unwrap().len(), 64);
+    assert_eq!(text, warmed.to_string());
+    // An unknown key is a clean 404, not an error and not a probe surface.
+    assert_eq!(
+        peer_read(TOKEN_A_PORT, &"ab".repeat(32), Some("fleet-secret"))
+            .await
+            .0,
+        404
+    );
+
+    // B holds the wrong secret, so A's cache is closed to it.
+    fleet_instance(
+        TOKEN_B_PORT,
+        &dir_b,
+        TOKEN_DEAD_UPSTREAM,
+        vec![peer_url(TOKEN_A_PORT)],
+        Some("wrong-secret".into()),
+    );
+    wait_for(TOKEN_B_PORT).await;
+
+    let (status, _, _) = post(TOKEN_B_PORT, &b, vec![]).await;
+    assert_eq!(
+        status, 502,
+        "a refused peer must fall through to the upstream, not be treated as a hit"
+    );
+
+    let text = scrape(TOKEN_B_PORT).await;
+    assert_eq!(series(&text, "witness_peer_errors_total"), 1.0);
+    assert_eq!(series(&text, "witness_peer_hits_total"), 0.0);
+    assert_eq!(series(&text, "witness_upstream_errors_total"), 1.0);
+
+    std::fs::remove_dir_all(&dir_a).ok();
+    std::fs::remove_dir_all(&dir_b).ok();
+}
+
+/// A dead peer costs the hot path an error counter and nothing else: the call
+/// still completes through the upstream, well inside the per-peer budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_peer_does_not_stall_the_request() {
+    let dir = std::env::temp_dir().join(format!("witness-e2e-deadpeer-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+
+    tokio::spawn(mock::serve(SLOW_MOCK_PORT, 0));
+    fleet_instance(
+        SLOW_PROXY_PORT,
+        &dir,
+        SLOW_MOCK_PORT,
+        vec![peer_url(DEAD_PEER_PORT)],
+        None,
+    );
+    wait_for(SLOW_MOCK_PORT).await;
+    wait_for(SLOW_PROXY_PORT).await;
+
+    let b = body("fleet lemma F3", "claude-sonnet-5");
+    let started = Instant::now();
+    let (status, _, cache) = post(SLOW_PROXY_PORT, &b, vec![]).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, 200);
+    assert_eq!(cache.as_deref(), Some("miss"));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "a dead peer must not stall the hot path; took {elapsed:?}"
+    );
+
+    let text = scrape(SLOW_PROXY_PORT).await;
+    assert_eq!(series(&text, "witness_peer_errors_total"), 1.0);
+    assert_eq!(series(&text, "witness_peer_hits_total"), 0.0);
+    assert_eq!(series(&text, "witness_requests_total{cache=\"miss\"}"), 1.0);
+
+    // The upstream really served it: one local record, named upstream.
+    let records = Journal::read_all_from(&dir.join("journal.log")).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].cache, "miss");
+    assert_eq!(
+        records[0].upstream,
+        format!("http://127.0.0.1:{SLOW_MOCK_PORT}")
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

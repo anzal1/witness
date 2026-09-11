@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
+use axum::extract::{Path as RoutePath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
@@ -16,11 +16,11 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cas::Cas;
-use crate::hash::request_key;
+use crate::hash::{blake3_hex, request_key};
 use crate::identity::{
     caps_allow_model, chain_from_b64, verify_chain, verify_request_signature, HDR_DELEGATION,
     HDR_IDENTITY, HDR_SIGNATURE, HDR_TIMESTAMP,
@@ -34,6 +34,17 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub const HDR_CACHE_OPT_IN: &str = "x-witness-cache";
 /// Local introspection. Never proxied, never recorded, never journaled.
 pub const METRICS_PATH: &str = "/witness/metrics";
+/// Fleet mode: the sibling-facing read of this instance's cache. Like
+/// `METRICS_PATH` it is a route, not a branch in the proxy handler, so a
+/// request for it can never reach the forwarding or recording path.
+pub const PEER_CACHE_PREFIX: &str = "/witness/peer/cache/";
+/// Whole-lookup budget for one peer: connect, response, body. A sibling that
+/// is dead, wedged or merely slow must not cost more than this, because the
+/// upstream can serve the request anyway.
+const PEER_BUDGET: Duration = Duration::from_millis(300);
+/// Length of a hex BLAKE3 request key, and the only shape the peer route
+/// accepts. A key is a path segment, so nothing else may reach `cache_path`.
+const REQ_KEY_LEN: usize = 64;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -56,6 +67,14 @@ pub struct Options {
     /// OTLP/HTTP collector to project recorded calls onto as GenAI spans.
     /// `None` disables the exporter entirely, including its background task.
     pub otlp_endpoint: Option<String>,
+    /// Fleet mode: sibling instances to ask on a local cache miss, tried in
+    /// order. Empty means this instance never talks to a peer; it still
+    /// *serves* the peer route, because serving and asking are independent.
+    pub peers: Vec<String>,
+    /// Shared secret for the peer route. Required on inbound peer reads and
+    /// sent on outbound ones. `None` leaves the route open, which is only
+    /// sane on a trusted network.
+    pub peer_token: Option<String>,
 }
 
 /// Cache index entry: maps a request key to the stored response.
@@ -157,6 +176,7 @@ pub async fn serve(opts: Options) -> Result<()> {
         .build()?;
     let port = opts.port;
     let replay = opts.replay;
+    let peers = opts.peers.clone();
     let metrics = Arc::new(Metrics::default());
     let gen_ai_system = otlp::gen_ai_system(&opts.upstream);
     let otlp = opts
@@ -183,6 +203,10 @@ pub async fn serve(opts: Options) -> Result<()> {
 
     let router = Router::new()
         .route(METRICS_PATH, get(metrics_endpoint))
+        .route(
+            &format!("{PEER_CACHE_PREFIX}:req_key"),
+            get(peer_cache_endpoint),
+        )
         .fallback(handle)
         .with_state(app);
 
@@ -194,6 +218,12 @@ pub async fn serve(opts: Options) -> Result<()> {
         "witness {} on http://{addr}  (journal + CAS recording every call, metrics at {METRICS_PATH})",
         if replay { "REPLAY" } else { "serving" }
     );
+    if !peers.is_empty() {
+        eprintln!(
+            "witness: fleet peers, asked in order before the upstream: {}",
+            peers.join(", ")
+        );
+    }
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -363,6 +393,215 @@ async fn metrics_endpoint(State(app): State<Arc<App>>) -> Response {
         .unwrap()
 }
 
+/// Compare secrets without a length-dependent early exit, so a wrong token
+/// leaks nothing about the right one beyond its length.
+fn token_matches(expected: &str, offered: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), offered.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The sibling-facing read of this instance's cache: squid-sibling shaped, a
+/// lookup of one exact request key and nothing else. There is no listing, no
+/// range and no write, so a peer can only confirm what it was already able to
+/// ask for. Like the metrics route it is a route rather than a branch in
+/// `handle`, so it is never forwarded upstream and never journaled.
+async fn peer_cache_endpoint(
+    State(app): State<Arc<App>>,
+    RoutePath(req_key): RoutePath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(expected) = &app.opts.peer_token {
+        let offered = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if !offered.map(|t| token_matches(expected, t)).unwrap_or(false) {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "peer cache requires Authorization: Bearer <peer token>",
+            );
+        }
+    }
+
+    // A key is a hex hash or it is nothing: this is what keeps an arbitrary
+    // path segment out of `cache_path`.
+    let well_formed =
+        req_key.len() == REQ_KEY_LEN && req_key.bytes().all(|b| b.is_ascii_hexdigit());
+    let entry = well_formed.then(|| app.cache_get(&req_key)).flatten();
+    let Some(entry) = entry else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "no cached response for this request key",
+        );
+    };
+    let bytes = match app.cas.get(&entry.resp_hash) {
+        Ok(Some(b)) => b,
+        _ => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cache index points at missing object",
+            )
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", entry.content_type)
+        // The original upstream status, carried out of band so the peer read
+        // itself can report transport-level outcomes (404, 401) truthfully.
+        .header("x-witness-status", entry.status.to_string())
+        .header("x-witness-resp", entry.resp_hash)
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+/// One sibling's answer, already checked against the hash it advertised.
+struct PeerHit {
+    /// `host:port` of the peer that answered, for the journal record.
+    authority: String,
+    status: u16,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+/// `host:port` for the journal, so an audit can tell a call this instance
+/// made from one it inherited, and from which sibling.
+fn peer_authority(peer: &str) -> String {
+    match reqwest::Url::parse(peer) {
+        Ok(url) => match (url.host_str(), url.port_or_known_default()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            _ => peer.trim_end_matches('/').to_string(),
+        },
+        Err(_) => peer.trim_end_matches('/').to_string(),
+    }
+}
+
+/// Ask each peer for this exact key, in order, first answer wins. A peer that
+/// is unreachable, unauthorized or over budget is counted and stepped past:
+/// the upstream is always the fallback, so no sibling can stall the hot path
+/// for longer than `PEER_BUDGET`.
+async fn peer_lookup(app: &App, req_key: &str) -> Option<PeerHit> {
+    for peer in &app.opts.peers {
+        let outcome = tokio::time::timeout(PEER_BUDGET, ask_peer(app, peer, req_key)).await;
+        match outcome {
+            Ok(Ok(Some(hit))) => return Some(hit),
+            // A clean miss is the common case and not an error.
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                app.metrics.peer_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("witness: peer {peer} lookup failed: {e:#}");
+            }
+            Err(_) => {
+                app.metrics.peer_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "witness: peer {peer} did not answer within {}ms",
+                    PEER_BUDGET.as_millis()
+                );
+            }
+        }
+    }
+    None
+}
+
+/// `Ok(None)` is a clean miss; `Err` is a peer that misbehaved.
+async fn ask_peer(app: &App, peer: &str, req_key: &str) -> Result<Option<PeerHit>> {
+    let url = format!("{}{PEER_CACHE_PREFIX}{req_key}", peer.trim_end_matches('/'));
+    let mut request = app.client.get(&url).timeout(PEER_BUDGET);
+    if let Some(token) = &app.opts.peer_token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = request.send().await.context("peer unreachable")?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("peer answered {}", resp.status());
+    }
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
+    let advertised = header("x-witness-resp").context("peer answer carries no x-witness-resp")?;
+    let status: u16 = header("x-witness-status")
+        .and_then(|v| v.parse().ok())
+        .context("peer answer carries no usable x-witness-status")?;
+    let content_type = header("content-type").unwrap_or_else(|| "application/octet-stream".into());
+    let bytes = resp.bytes().await.context("reading peer body")?.to_vec();
+
+    // Content addressing is the trust boundary here. A peer that hands back
+    // bytes which do not hash to what it advertised is a peer we disbelieve,
+    // token or no token, so the fleet can never poison a local cache.
+    let actual = blake3_hex(&bytes);
+    if actual != advertised {
+        anyhow::bail!("peer body hashes to {actual}, not the advertised {advertised}");
+    }
+    Ok(Some(PeerHit {
+        authority: peer_authority(peer),
+        status,
+        content_type,
+        bytes,
+    }))
+}
+
+/// Adopt a sibling's answer as this instance's own: store the bytes in the
+/// local CAS, index them, and journal the call here. Journals stay
+/// per-instance, so the record says `peer:<host:port>` rather than pretending
+/// the upstream was reached.
+#[allow(clippy::too_many_arguments)]
+fn serve_peer_hit(
+    app: &App,
+    caller: &Caller,
+    req_key: &str,
+    body_hash: &str,
+    path: &str,
+    model: &Option<String>,
+    hit: PeerHit,
+    start_unix_nanos: u64,
+) -> Result<Response> {
+    let resp_hash = app.cas.put(&hit.bytes)?;
+    app.cache_put(
+        req_key,
+        &CacheEntry {
+            resp_hash: resp_hash.clone(),
+            status: hit.status,
+            content_type: hit.content_type.clone(),
+            streamed: hit.content_type.starts_with("text/event-stream"),
+        },
+    )?;
+    let record = app.journal.append_invoke(InvokeEntry {
+        agent: caller.agent.clone(),
+        root: caller.root.clone(),
+        req: body_hash.to_string(),
+        resp: resp_hash.clone(),
+        path: path.to_string(),
+        model: model.clone(),
+        upstream: format!("peer:{}", hit.authority),
+        cache: "peer".into(),
+        status: hit.status,
+        sig: caller.sig.clone(),
+    })?;
+    app.metrics.peer_hits.fetch_add(1, Ordering::Relaxed);
+    let mut resp = Response::builder()
+        .status(hit.status)
+        .header("content-type", hit.content_type)
+        .body(Body::from(hit.bytes))
+        .unwrap();
+    witness_headers(&mut resp, record.seq, body_hash, &resp_hash, "peer");
+    app.emit_span(
+        start_unix_nanos,
+        record.seq,
+        "peer",
+        body_hash,
+        &resp_hash,
+        &caller.agent,
+        model,
+        hit.status,
+    );
+    Ok(resp)
+}
+
 async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     let started = Instant::now();
     let response = proxy_request(&app, req).await;
@@ -496,6 +735,32 @@ async fn proxy_request(app: &Arc<App>, req: Request) -> Response {
             entry.status,
         );
         return resp;
+    }
+
+    // --- fleet: ask the siblings before paying the upstream ---
+    // A peer is an extension of the local cache, so this runs under exactly
+    // the conditions a local hit would have: reuse enabled, the request safe
+    // to reuse, and not replay, whose whole point is zero network.
+    if !app.opts.peers.is_empty() && !app.opts.replay && app.opts.cache && reusable(&body, &headers)
+    {
+        if let Some(hit) = peer_lookup(app, &req_key).await {
+            return match serve_peer_hit(
+                app,
+                &caller,
+                &req_key,
+                &body_hash,
+                &path,
+                &model,
+                hit,
+                start_unix_nanos,
+            ) {
+                Ok(resp) => resp,
+                Err(e) => json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("adopting peer response failed: {e:#}"),
+                ),
+            };
+        }
     }
 
     // --- forward upstream ---
