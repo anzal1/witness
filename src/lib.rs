@@ -7,6 +7,7 @@
 //!   hash-chained journal, with deterministic replay and Merkle commitments,
 //!   anchored to a public transparency log.
 
+pub mod agent_record;
 pub mod anchor;
 pub mod cas;
 pub mod client;

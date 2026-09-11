@@ -90,6 +90,47 @@ rekor-cli get --uuid <uuid> --rekor_server https://rekor.sigstore.dev
 
 Use `--commitment <path>` to anchor an older commitment, and `--rekor-url` to target a private or self-hosted log.
 
+### Standard export (IETF agent-record draft)
+
+The native journal format is witness's own. [draft-maintainer-1f916-agent-record-01](https://datatracker.ietf.org/doc/draft-maintainer-1f916-agent-record/) standardises very nearly the same object, so witness can also emit its record as a draft-shaped dossier:
+
+```bash
+witness export-record --out dossier/                    # whole journal
+witness export-record --out dossier/ --agent <hex-pubkey> \
+  --sign-key keys/registry                              # one agent, explicit signer
+witness verify-record dossier/                          # offline, no network
+witness verify-record dossier/ --registry-key <hex>     # with an out-of-band key pin
+```
+
+The export writes `dossier.json` (keys, events, inclusion proofs, checkpoint, registry signature), `checkpoint.json` (the signed tree head on its own, so a third party can countersign it), and `registry.pub`. Verification is fully offline and reports the draft's four-valued verdict.
+
+**Conformance, honestly.** The draft is SHA-256 throughout where witness is natively BLAKE3, so this is a translation and not a rename: events are re-hashed under SHA-256 and re-committed under an RFC 6962 tree, and each exported event keeps the BLAKE3 hash of the journal record it came from so the two artifacts pin to each other.
+
+What matches the draft exactly:
+
+- key binding payload `1f916.key-bind.v1:<handle>:<pk_b64url>` and RFC 7638 thumbprints over the Ed25519 JWK (Section 3.1);
+- checkpoint payload `1f916.checkpoint.v1:<log>:<tree_size>:<root_hex>:<created_at_ms>`, Ed25519-signed (Section 3.2);
+- RFC 6962 Section 2.1 leaf and node hashing, and Section 2.1.1 inclusion proofs (Section 3.2);
+- dossier signature `1f916.record.v1:<sha256_hex>` over the SHA-256 of the JCS-canonical core (Section 3.6);
+- the anchor rule and the four-valued verdict, so a dossier verified with a key read out of its own file reports `unanchored`, never "verified" (Section 3.6);
+- the Section 3.6 hardening rules: indices halved by integer division rather than bitwise shift, and hashes validated as exactly 64 lowercase hex characters before decoding.
+
+What is **provisional**, because draft -01 does not specify it:
+
+- the event object. Section 2 says only that an event "carries the hash of its predecessor" and gives no field names, types, or hash input. Our `Event` fields are our own choice and are flagged as such in `src/agent_record.rs`;
+- the member list of the "dossier core", which Section 3.6 hashes but never enumerates, plus the on-disk file names and media type (Section 5 registers nothing);
+- custody. Section 3.1 says registries MUST record a custody disclosure, but witness only ever sees a public key at the proxy boundary, so it emits `undisclosed`, a value outside the draft's taxonomy and deliberately not a claim.
+
+What witness does **not** implement:
+
+- witnesses (Section 3.3). There are no countersignatures, so the `witnessed` verdict is unreachable and `verify-record` never returns it;
+- consistency proofs between two checkpointed sizes, and signed write receipts (Section 3.2);
+- the unauthenticated registry HTTP surface (Section 3.2). A dossier is a file, not a service;
+- memory seals (Section 3.4) and cross-agent attestations (Section 3.5), which witness has no source of;
+- key rotation and revocation events (Section 3.1). Witness observes keys in traffic, it does not run their lifecycle, so a key binding it exports carries a signature only when the exporter also held that agent's secret key. Otherwise `binding_signature` is `null`, meaning observed rather than attested.
+
+This is an early implementation of an individual submission that has no IETF standing yet. Treat the format as tracking a moving target.
+
 ## Cache policy (honest by design)
 
 LLM calls are nondeterministic. Everything is **recorded**, but a response is only **reused** when that's semantically sound: `temperature: 0`, an explicit `seed`, or the caller opting in with `x-witness-cache: allow`. Replay mode reuses everything — that's its point.
@@ -161,7 +202,9 @@ This is a crowded space, and several projects overlap heavily with witness. Some
 | **[Bifrost](https://docs.getbifrost.ai/overview)** (commercial) | HMAC-signed audit events at creation, append-only archival | ~11µs gateway overhead vs witness's ~250µs |
 | **[LiteLLM](https://github.com/BerriAI/litellm/discussions/25237)** (PRs #25329 / #30238) | Per-call post-quantum (ML-DSA-65) signature chaining, offline verification | Lives inside the most widely deployed LLM proxy |
 | **[Armalo](https://www.armalo.ai/learn/merkle-tree-agent-audit-logs)** | Merkle audit logs **anchored to Sigstore Rekor** with inclusion proofs | Purpose-built audit product with a hosted UI; witness now anchors to Rekor too (`witness anchor`) |
-| **[IETF draft-maintainer-1f916-agent-record](https://datatracker.ietf.org/doc/draft-maintainer-1f916-agent-record/)** | Ed25519-bound append-only logs, signed Merkle heads, independent countersigning witnesses | It is becoming a **standard**; witness currently implements a bespoke format |
+
+| **[Armalo](https://www.armalo.ai/learn/merkle-tree-agent-audit-logs)** | Merkle audit logs **anchored to Sigstore Rekor** with inclusion proofs | Already ships the external anchoring that is only issue #2 here |
+| **[IETF draft-maintainer-1f916-agent-record](https://datatracker.ietf.org/doc/draft-maintainer-1f916-agent-record/)** | Ed25519-bound append-only logs, signed Merkle heads, independent countersigning witnesses | It is becoming a **standard**, and it has a live registry with independent witnesses. Witness now exports to it (`witness export-record`, see [Standard export](#standard-export-ietf-agent-record-draft)) but runs no witnesses of its own |
 | LiteLLM / Helicone / Portkey (base features) | Proxying, caching, logging | Mature, hosted, multi-provider |
 | Dapr 1.18 attestation, OTel GenAI semconv | Workflow-history signing; trace schema | Established ecosystems |
 
@@ -182,7 +225,8 @@ If you need a production agent gateway today, look at Wirken first. If you want 
 
 ## Design
 
-Rust, ~2k lines: `tokio`/`axum` proxy, BLAKE3 hashing (incremental, so streams are fingerprinted as they pass through), `ed25519-dalek` (plus SHA-256, but only where Rekor's entry format demands it), flat-file git-style CAS, JSONL hash-chained journal, hand-rolled Merkle (~100 lines, fully tested). One static binary, no database, no daemon dependencies.
+
+Rust: `tokio`/`axum` proxy, BLAKE3 hashing (incremental, so streams are fingerprinted as they pass through), `ed25519-dalek`, flat-file git-style CAS, JSONL hash-chained journal, hand-rolled Merkle (fully tested). SHA-256 appears only where an external format demands it: Rekor entries and the RFC 6962 tree in the standard export. One static binary, no database, no daemon dependencies.
 
 ```
 agent ──signed request──▶ witness ──▶ model API

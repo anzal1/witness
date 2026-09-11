@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use witness::cas::Cas;
 use witness::identity::{self, Delegation, Keypair};
 use witness::journal::{self, Journal};
-use witness::{anchor, client, merkle, mock, proxy};
+use witness::{agent_record, anchor, client, merkle, mock, proxy};
 
 #[derive(Parser)]
 #[command(
@@ -181,6 +181,28 @@ enum Command {
     },
     /// Journal and cache statistics.
     Stats,
+    /// Export the journal as an IETF agent-record dossier
+    /// (draft-maintainer-1f916-agent-record-01).
+    ExportRecord {
+        /// Directory to write the dossier into (created if absent).
+        #[arg(long)]
+        out: PathBuf,
+        /// Restrict the export to one agent: hex public key, or "anonymous".
+        #[arg(long)]
+        agent: Option<String>,
+        /// Key that signs the checkpoint and the dossier (the registry role).
+        /// Defaults to <data-dir>/registry, generated on first use.
+        #[arg(long = "sign-key")]
+        sign_key: Option<PathBuf>,
+    },
+    /// Offline-verify an agent-record dossier directory.
+    VerifyRecord {
+        dir: PathBuf,
+        /// Registry public key (hex, or a .pub file) obtained out of band.
+        /// Without it the strongest available verdict is "unanchored".
+        #[arg(long)]
+        registry_key: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -541,7 +563,88 @@ async fn main() -> Result<()> {
             println!("agents:   {}", agents.len());
             Ok(())
         }
+        Command::ExportRecord {
+            out,
+            agent,
+            sign_key,
+        } => {
+            let records = Journal::read_all_from(&data_dir.join("journal.log"))?;
+            Journal::verify_chain(&records).context("refusing to export a broken chain")?;
+            let signer = load_or_create_registry_key(&data_dir, sign_key.as_deref())?;
+            let summary = agent_record::export(agent_record::ExportOptions {
+                records: &records,
+                agent: agent.as_deref(),
+                signer: &signer,
+                out_dir: &out,
+            })?;
+            println!("log:       {}", summary.log);
+            println!("events:    {}", summary.events);
+            println!("tree_size: {}", summary.tree_size);
+            println!("root:      {}", summary.root_sha256);
+            for file in &summary.files {
+                eprintln!("wrote {}", file.display());
+            }
+            eprintln!(
+                "conforms to {} (see README: parts of the event schema are provisional)",
+                agent_record::SPEC
+            );
+            eprintln!(
+                "publish the registry key {} out of band — a key read from the dossier proves only internal consistency",
+                signer.public_hex()
+            );
+            Ok(())
+        }
+        Command::VerifyRecord { dir, registry_key } => {
+            let pin = match registry_key {
+                Some(v) => Some(resolve_pubkeys(vec![v])?.remove(0)),
+                None => None,
+            };
+            let report = agent_record::verify(&dir, pin.as_deref())?;
+            println!("verdict:   {}", report.verdict.as_str());
+            println!("log:       {}", report.log);
+            println!("subject:   {}", report.subject);
+            println!("events:    {}", report.events);
+            println!("tree_size: {}", report.tree_size);
+            println!("root:      {}", report.root_sha256);
+            println!("signer:    {}", report.registry_key);
+            if report.unsigned_bindings > 0 {
+                println!(
+                    "note:      {} key binding(s) carry no signature — the key was observed, not attested",
+                    report.unsigned_bindings
+                );
+            }
+            if report.verdict == agent_record::Verdict::Unanchored {
+                eprintln!(
+                    "unanchored: every key came from the dossier itself. Re-run with --registry-key <hex> obtained out of band."
+                );
+            }
+            Ok(())
+        }
     }
+}
+
+/// The registry-role signing key. An explicit `--sign-key` wins; otherwise
+/// `<data-dir>/registry.key`, generated on first use so an export never
+/// silently produces an unsigned dossier.
+fn load_or_create_registry_key(
+    data_dir: &std::path::Path,
+    sign_key: Option<&std::path::Path>,
+) -> Result<Keypair> {
+    if let Some(path) = sign_key {
+        return Keypair::load(path);
+    }
+    let default = data_dir.join("registry");
+    if default.with_extension("key").exists() {
+        return Keypair::load(&default);
+    }
+    let key = Keypair::generate()?;
+    key.save(&default)?;
+    eprintln!(
+        "generated registry key {} -> {}.key",
+        key.public_hex(),
+        default.display()
+    );
+    Ok(key)
 }
 
 fn resolve_pubkeys(values: Vec<String>) -> Result<Vec<String>> {
