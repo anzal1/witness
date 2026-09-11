@@ -67,7 +67,7 @@ witness audit --contains "secret-dataset-name"
 witness replay --port 8788         # serve the recorded run; zero upstream calls; misses are 409
 ```
 
-Every response carries `x-witness-seq`, `x-witness-req`, `x-witness-resp` (BLAKE3 hashes), and `x-witness-cache: miss|hit|replay`.
+Every response carries `x-witness-seq`, `x-witness-req`, `x-witness-resp` (BLAKE3 hashes), and `x-witness-cache: miss|hit|peer|replay`.
 
 ### Anchoring to Rekor
 
