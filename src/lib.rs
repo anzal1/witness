@@ -18,5 +18,6 @@ pub mod mcp;
 pub mod merkle;
 pub mod metrics;
 pub mod mock;
+pub mod oracle;
 pub mod otlp;
 pub mod proxy;

@@ -630,3 +630,111 @@ async fn otlp_projection_emits_genai_spans() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The thesis, end to end: a response nobody would reuse on sampling grounds
+/// becomes reusable once an external check vouches for it. The temperature
+/// never changes; only what is known about the answer does.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_attestation_unlocks_a_nondeterministic_request() {
+    let dir = std::env::temp_dir().join(format!("witness-e2e-oracle-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let mock_port = 39820;
+    let port = 39821;
+
+    tokio::spawn(mock::serve(mock_port, 0));
+    let proxy_dir = dir.clone();
+    tokio::spawn(async move {
+        proxy::serve(proxy::Options {
+            port,
+            upstream: format!("http://127.0.0.1:{mock_port}"),
+            data_dir: proxy_dir,
+            mode: proxy::Mode::Open,
+            trust: Vec::new(),
+            cache: true,
+            replay: false,
+            otlp_endpoint: None,
+        })
+        .await
+        .unwrap();
+    });
+    wait_for(mock_port).await;
+    wait_for(port).await;
+
+    // temperature 1: recorded, never reused, however often it is asked.
+    let mut hot = body("attest this sampled answer", "claude-sonnet-5");
+    hot["temperature"] = json!(1.0);
+    let (status, first, cache) = post(port, &hot, vec![]).await;
+    assert_eq!(status, 200);
+    assert_eq!(cache.as_deref(), Some("miss"));
+    assert_eq!(post(port, &hot, vec![]).await.2.as_deref(), Some("miss"));
+
+    // An oracle reads the recorded response body and exits 0.
+    let attestation = witness::oracle::attest(witness::oracle::AttestOptions {
+        data_dir: &dir,
+        seq: 1,
+        oracle: "grep -q mock",
+        name: "grep",
+        key: None,
+        method: witness::oracle::DEFAULT_METHOD,
+    })
+    .unwrap();
+    assert!(attestation.verified, "the mock's text contains \"mock\"");
+
+    // Same body, same temperature, now served from the record.
+    let (status, third, cache) = post(port, &hot, vec![]).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        cache.as_deref(),
+        Some("hit"),
+        "an attested request is reusable whatever its sampling parameters"
+    );
+    assert_eq!(third, first, "the hit must be the attested bytes");
+
+    // A different nondeterministic request is untouched by that attestation.
+    let mut other = body("some other sampled answer", "claude-sonnet-5");
+    other["temperature"] = json!(1.0);
+    assert_eq!(post(port, &other, vec![]).await.2.as_deref(), Some("miss"));
+    assert_eq!(post(port, &other, vec![]).await.2.as_deref(), Some("miss"));
+
+    // The attestation is in the same chain, naming the command that vouched.
+    let records = Journal::read_all_from(&dir.join("journal.log")).unwrap();
+    Journal::verify_chain(&records).unwrap();
+    let attest_record = records
+        .iter()
+        .find(|r| r.path == "attest:grep:1")
+        .expect("attestation is journaled");
+    assert_eq!(attest_record.seq, attestation.seq.unwrap());
+    assert_eq!(attest_record.req, records[0].hash);
+    let cas = witness::cas::Cas::open(&dir).unwrap();
+    let evidence: Value =
+        serde_json::from_slice(&cas.get(&attest_record.resp).unwrap().unwrap()).unwrap();
+    assert_eq!(evidence["oracle"], "grep -q mock");
+    assert_eq!(evidence["req_key"], attestation.req_key);
+
+    // And the marker the proxy consulted is listed for an operator.
+    let markers = witness::oracle::list(&dir).unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].req_key, attestation.req_key);
+
+    // A refuted oracle over that same record leaves the journal untouched.
+    let before = records.len();
+    let refuted = witness::oracle::attest(witness::oracle::AttestOptions {
+        data_dir: &dir,
+        seq: 1,
+        oracle: "grep -q 'this string is not in any mock response'",
+        name: "grep",
+        key: None,
+        method: witness::oracle::DEFAULT_METHOD,
+    })
+    .unwrap();
+    assert!(!refuted.verified);
+    assert_eq!(
+        Journal::read_all_from(&dir.join("journal.log"))
+            .unwrap()
+            .len(),
+        before,
+        "a refutation must not append a record"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
