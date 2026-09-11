@@ -363,16 +363,15 @@ Reading these honestly:
 - **p99 shows occasional multi-millisecond outliers** (filesystem scheduling on the journal append). Sub-millisecond median, low-single-digit-millisecond tail — not a hard sub-ms p99 guarantee.
 - **A cache hit's real saving isn't the 0.44 ms** — it's the entire upstream inference call that never happens.
 
-Throughput plateaus around **37k recorded calls/sec** on this machine, and past that ceiling latency grows with concurrency (queueing, as expected):
+Throughput plateaus around **53k recorded calls/sec** on this machine, and past that ceiling latency grows with concurrency (queueing, as expected):
 
 | concurrency | p50 | p99 | req/s |
 | --- | --- | --- | --- |
-| 20 | 0.52 ms | 1.4 ms | 35k |
-| 50 | 1.25 ms | 3.0 ms | 38k |
-| 100 | 2.46 ms | 8.4 ms | 37k |
-| 200 | 4.73 ms | 13.3 ms | 37k |
+| 20 | 0.38 ms | 0.58 ms | 47k |
+| 100 | 1.66 ms | 7.9 ms | 53k |
+| 200 | 2.91 ms | 15.5 ms | 53k |
 
-The limiter is the journal's serialized append — see [#9](https://github.com/anzal1/witness/issues/9) for the batched group-commit fix. For scale context: OpenAI's 10,000-agent run averaged ~8.5 messages/sec, about 4,000× below this ceiling. The model API will be your bottleneck, not witness.
+The journal appends through a single writer thread that fuses concurrent submissions into one write and one flush per batch (up to 256 records), which raised the ceiling from the ~37k of earlier releases and cut the p99 at low concurrency from 1.4 ms to 0.6 ms. For scale context: the 10,000-agent research run that motivated this project averaged about 8.5 messages/sec, three orders of magnitude below this ceiling. The model API will be your bottleneck, not witness.
 
 ## Prior art — read this before you adopt it
 
