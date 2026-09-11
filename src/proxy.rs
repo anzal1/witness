@@ -28,6 +28,7 @@ use crate::identity::{
 };
 use crate::journal::{now_ms, InvokeEntry, Journal, Record};
 use crate::metrics::Metrics;
+use crate::oracle;
 use crate::otlp::{self, Exporter, SpanData};
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -74,6 +75,8 @@ pub struct App {
     client: reqwest::Client,
     opts: Options,
     cache_dir: PathBuf,
+    /// Marker dir written by `witness attest`; see `reusable`.
+    attested_dir: PathBuf,
     metrics: Arc<Metrics>,
     otlp: Option<Exporter>,
     /// Resolved once from the upstream URL; every span carries it.
@@ -153,6 +156,9 @@ pub async fn serve(opts: Options) -> Result<()> {
     let journal = Journal::open(&opts.data_dir)?;
     let cache_dir = opts.data_dir.join("cache");
     std::fs::create_dir_all(&cache_dir)?;
+    // Not created here: its absence is the common case and is what makes the
+    // attestation check a single failed stat.
+    let attested_dir = oracle::attested_dir(&opts.data_dir);
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -176,6 +182,7 @@ pub async fn serve(opts: Options) -> Result<()> {
         client,
         opts,
         cache_dir,
+        attested_dir,
         metrics,
         otlp,
         gen_ai_system,
@@ -314,9 +321,21 @@ fn body_model(body: &[u8]) -> Option<String> {
 }
 
 /// A request is safe to *reuse* from cache only when it's deterministic
-/// (temperature 0 or an explicit seed) or the caller opts in. Everything is
-/// *recorded* regardless — replay always works.
-fn reusable(body: &[u8], headers: &HeaderMap) -> bool {
+/// (temperature 0 or an explicit seed), the caller opts in, or a verifier
+/// oracle has attested the recorded response. Everything is *recorded*
+/// regardless — replay always works.
+///
+/// The attestation check comes first and costs one stat, reached only when a
+/// cache entry already exists for this key.
+fn reusable(
+    body: &[u8],
+    headers: &HeaderMap,
+    attested_dir: &std::path::Path,
+    req_key: &str,
+) -> bool {
+    if oracle::is_attested(attested_dir, req_key) {
+        return true;
+    }
     if headers
         .get(HDR_CACHE_OPT_IN)
         .and_then(|v| v.to_str().ok())
@@ -444,7 +463,7 @@ async fn proxy_request(app: &Arc<App>, req: Request) -> Response {
     let cached = app.cache_get(&req_key);
     let serve_cached = match (&cached, app.opts.replay, app.opts.cache) {
         (Some(_), true, _) => true,
-        (Some(_), false, true) => reusable(&body, &headers),
+        (Some(_), false, true) => reusable(&body, &headers, &app.attested_dir, &req_key),
         _ => false,
     };
 

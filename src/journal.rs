@@ -109,6 +109,10 @@ struct Writer {
     next_seq: u64,
     prev_hash: String,
     committed: Arc<AtomicU64>,
+    /// Bytes this writer believes the journal holds. A mismatch against the
+    /// file's real size means another process appended, so the cached tip is
+    /// stale; see `commit`.
+    written_len: u64,
     /// Set when a write fails partway. The file then ends at an unknown
     /// offset, so appending after it would corrupt the middle of the chain
     /// rather than its tail. Every later append fails loudly instead.
@@ -133,6 +137,29 @@ impl Writer {
         }
     }
 
+    /// Pick up a tip another process moved. `witness attest` and `witness mcp`
+    /// both open their own handle on a journal a proxy may be serving from, so
+    /// a cached tip can go stale between batches. One fstat notices it, and
+    /// only a mismatch pays for the re-read. Because it guards the batch and
+    /// not the record, a full batch of 256 amortises the check 256 ways.
+    ///
+    /// This closes the stale-tip case, not a true simultaneous-write race: the
+    /// journal is still meant to have one hot writer per data dir.
+    fn resync(&mut self) -> Result<()> {
+        let on_disk = self.file.metadata().map(|m| m.len()).unwrap_or(0);
+        if on_disk == self.written_len {
+            return Ok(());
+        }
+        let (next_seq, prev_hash) = Journal::recover_tip(&self.path)?;
+        self.next_seq = next_seq;
+        self.prev_hash = prev_hash;
+        // Re-stat rather than trusting `on_disk`: recovering the tip may have
+        // trimmed a partial record the other writer left behind.
+        self.written_len = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        self.committed.store(next_seq - 1, Ordering::Release);
+        Ok(())
+    }
+
     /// One group commit: hash every entry in submission order into a single
     /// buffer, then one `write_all` and one `flush`. The in-memory chain tip
     /// moves only once both have succeeded, so a failed batch leaves the
@@ -141,6 +168,15 @@ impl Writer {
         if let Some(reason) = self.poisoned.clone() {
             for job in batch.drain(..) {
                 let _ = job.reply.send(Err(anyhow!("{reason}")));
+            }
+            return;
+        }
+        if let Err(e) = self.resync() {
+            // The tip was not moved and nothing was written, so a later batch
+            // can still succeed once whatever damaged the file is gone. Fail
+            // this one rather than chain from a tip we no longer trust.
+            for job in batch.drain(..) {
+                let _ = job.reply.send(Err(anyhow!("{e:#}")));
             }
             return;
         }
@@ -184,6 +220,7 @@ impl Writer {
             Ok(()) => {
                 self.next_seq = seq;
                 self.prev_hash = prev;
+                self.written_len += self.buf.len() as u64;
                 self.committed.store(seq - 1, Ordering::Release);
                 for (record, reply) in waiting {
                     let _ = reply.send(Ok(record));
@@ -226,6 +263,7 @@ impl Journal {
             next_seq,
             prev_hash,
             committed: committed.clone(),
+            written_len: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             poisoned: None,
             buf: Vec::with_capacity(64 * 1024),
         };
@@ -555,6 +593,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `witness attest` appends through its own handle while a proxy holds
+    /// one open. A handle that trusted its cached tip would reuse a sequence
+    /// number and break the chain, so it re-reads when the file has grown.
+    #[test]
+    fn a_second_handle_does_not_break_the_chain() {
+        let dir = tmp_dir("two-writers");
+        std::fs::remove_dir_all(&dir).ok();
+        let serving = Journal::open(&dir).unwrap();
+        serving.append_invoke(entry(1)).unwrap();
+
+        // A separate handle, as a separate process would have.
+        let attesting = Journal::open(&dir).unwrap();
+        attesting.append_invoke(entry(2)).unwrap();
+
+        // The first handle's cached tip is now stale; the next append must
+        // pick up where the other writer left off.
+        let third = serving.append_invoke(entry(3)).unwrap();
+        assert_eq!(third.seq, 3);
+
+        let records = journal_records(&dir);
+        assert_eq!(records.len(), 3);
+        assert_eq!(Journal::verify_chain(&records).unwrap(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Tolerating a torn tail must not become tolerating a damaged journal.
     /// Anything that parses as a complete line and still is not a record is
     /// corruption, wherever it sits, and opening must refuse.
@@ -591,6 +654,53 @@ mod tests {
         assert!(
             Journal::open(&dir).is_err(),
             "a finished line is corruption, not a torn write, even at the end"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn journal_records(dir: &Path) -> Vec<Record> {
+        Journal::read_all_from(&dir.join("journal.log")).unwrap()
+    }
+
+    /// `n` appends pushed in hard enough from several threads that the writer
+    /// sees batches rather than a stream of single records.
+    fn burst(journal: &Journal, n: usize) {
+        const THREADS: usize = 8;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for i in 0..n / THREADS {
+                        journal.append_invoke(entry(i as u8)).unwrap();
+                    }
+                });
+            }
+        });
+    }
+
+    /// The stale-tip check guards the batch, not the record, so the case that
+    /// has to hold is a foreign append landing between two batches. Bursts on
+    /// either side make the batches real, and the chain must still come out
+    /// contiguous across the record the other handle slipped in.
+    #[test]
+    fn a_second_handle_between_batches_does_not_break_the_chain() {
+        const BURST: usize = 320;
+        let dir = tmp_dir("two-writers-batched");
+        std::fs::remove_dir_all(&dir).ok();
+        let serving = Journal::open(&dir).unwrap();
+        burst(&serving, BURST);
+
+        // A separate handle, as a separate process would have.
+        let attesting = Journal::open(&dir).unwrap();
+        let foreign = attesting.append_invoke(entry(9)).unwrap();
+        assert_eq!(foreign.seq, BURST as u64 + 1);
+
+        burst(&serving, BURST);
+        let records = journal_records(&dir);
+        assert_eq!(records.len(), BURST * 2 + 1);
+        assert_eq!(
+            Journal::verify_chain(&records).unwrap(),
+            BURST * 2 + 1,
+            "the batch after the foreign append chains from it, not past it"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

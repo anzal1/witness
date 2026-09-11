@@ -249,6 +249,22 @@ pub fn verify_request_signature(
         .context("request signature invalid")
 }
 
+/// Sign arbitrary bytes with no framing of our own. Used where the message is
+/// already a commitment in its own right, such as a journal record's chain
+/// hash, and so needs no domain separator to be unambiguous.
+pub fn sign_bytes(key: &Keypair, message: &[u8]) -> String {
+    hex::encode(key.signing.sign(message).to_bytes())
+}
+
+pub fn verify_bytes(pubkey_hex: &str, sig_hex: &str, message: &[u8]) -> Result<()> {
+    let key = parse_pubkey(pubkey_hex)?;
+    let sig_bytes: [u8; 64] = hex::decode(sig_hex)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("signature must be 64 bytes"))?;
+    key.verify(message, &Signature::from_bytes(&sig_bytes))
+        .context("signature invalid")
+}
+
 // ---------- chain (de)serialization for headers/files ----------
 
 pub fn chain_to_b64(chain: &[Delegation]) -> Result<String> {
