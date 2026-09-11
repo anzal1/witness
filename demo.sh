@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# witness demo: record -> cache -> identity -> enforcement -> commit -> prove -> audit -> replay
+# witness demo: record -> cache -> identity -> enforcement -> commit -> anchor -> prove -> audit -> replay
 # Uses the built-in mock upstream (800ms simulated inference), so no API key is needed.
 set -euo pipefail
 
@@ -43,8 +43,11 @@ step "journal: hash chain verifies; every call recorded with agent + root identi
 "$BIN" --data-dir "$DATA" log
 "$BIN" --data-dir "$DATA" stats
 
-step "commit: Merkle root over the run (anchor it anywhere public to make it binding)"
+step "commit: Merkle root over the run"
 "$BIN" --data-dir "$DATA" commit
+
+step "anchor: the Rekor entry that would make that root public (dry run, no network)"
+"$BIN" --data-dir "$DATA" anchor --key "$KEYS/alice" --dry-run
 
 step "prove: third-party-checkable inclusion proof for record #1"
 "$BIN" --data-dir "$DATA" prove --seq 1 > "$WORK/proof.json"
