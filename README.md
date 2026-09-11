@@ -15,6 +15,7 @@
 - **the record is tamper-evident** — entries live in a hash-chained journal, so any edit, deletion, or reorder breaks the chain and `witness verify` finds it;
 - **calls are attributed** — agents sign requests with Ed25519 keys carrying delegation chains from a human root key, verified locally with zero network calls (the **Pact** protocol);
 - **grants are enforced, not just logged** — delegations are narrowing-only (`model:claude-*`), and a request outside the grant is refused at the network boundary before it reaches the provider;
+- **tool calls join the same chain:** `witness mcp -- <server>` wraps a stdio MCP server, so one journal covers what your agents asked a model *and* what they did with tools;
 - **single records are provable to outsiders** — a Merkle commitment lets you hand a third party an inclusion proof, or answer *"did any agent ever touch X?"* against a committed root.
 
 The ordering is the whole design bet. Audit tooling that asks to be adopted on principle doesn't get adopted, and a recorder switched on *after* a question is asked is worthless. So the thing you install for cost is the thing that turns out to be evidence — already running before anyone needed it.
@@ -131,6 +132,64 @@ What witness does **not** implement:
 
 This is an early implementation of an individual submission that has no IETF standing yet. Treat the format as tracking a moving target.
 
+## Recording tool calls (MCP)
+
+The proxy above records the **model** boundary. `witness mcp` records the **tool** boundary, into the same journal and the same content-addressed store, so one `witness audit` answers "what did my agents actually do" across both.
+
+It is a transparent stdio wrapper. You put it in front of any MCP server; it spawns that server, pipes JSON-RPC between the client and the server line by line, and writes a record for every `tools/call` and its matching response.
+
+```bash
+witness mcp -- npx -y @modelcontextprotocol/server-filesystem ~/projects
+```
+
+In a Claude Desktop or Claude Code style `mcpServers` config, change the command and push the real server behind `--`:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "witness",
+      "args": [
+        "--data-dir", "/Users/you/witness-data",
+        "mcp", "--agent", "claude-desktop", "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "/Users/you/projects"
+      ]
+    }
+  }
+}
+```
+
+Nothing else changes. The client still talks to the server it configured, the server's stderr still goes where it always went, and on exit witness prints a one line summary of what it recorded and what it let pass.
+
+Tool calls land in the journal as ordinary invoke records, so `verify`, `log`, `commit`, `prove` and `audit` work on them unchanged:
+
+| field | value |
+| --- | --- |
+| `agent` | `mcp-client`, or whatever `--agent` says |
+| `path` | `mcp:tools/call:<tool name>` |
+| `upstream` | `mcp:<server program>` |
+| `model` | absent, a tool call has no model |
+| `cache` | `miss`, v1 records tool calls but never replays them |
+| `status` | `200`, or `500` if the reply is a JSON-RPC error |
+| `req` / `resp` | content hashes of the full request and response frames |
+
+So after a session:
+
+```bash
+witness audit --contains "customers.csv"   # which agent read that file, through which tool
+witness verify                             # one chain over model calls and tool calls together
+```
+
+### What v1 does not do
+
+Stated plainly, because the gaps matter more than the feature list:
+
+- **stdio transport only.** Streamable HTTP MCP servers are not wrapped. The stdio framing is newline delimited JSON-RPC 2.0 per the [MCP specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) revision `2026-07-28`, which has been the same in every published revision, so older servers work too.
+- **`tools/call` only.** `initialize`, `tools/list`, `resources/*`, `prompts/*` and every notification are forwarded untouched and merely counted. They are visible in the exit summary and nowhere else.
+- **No replay and no cache at this boundary.** Tool calls have side effects. Serving one from a record would be a lie about what happened, so witness records them and stops there.
+- **No identity yet.** MCP carries no Pact signature, so tool records are attributed to the `--agent` label rather than to a verified key. The label is operator asserted, not proven.
+- **Correlation is by JSON-RPC id.** A server that never answers a call leaves it unrecorded, and the summary says how many.
+
 ## Cache policy (honest by design)
 
 LLM calls are nondeterministic. Everything is **recorded**, but a response is only **reused** when that's semantically sound: `temperature: 0`, an explicit `seed`, or the caller opting in with `x-witness-cache: allow`. Replay mode reuses everything — that's its point.
@@ -235,10 +294,22 @@ agent ──signed request──▶ witness ──▶ model API
                             ├─ journal.log  hash-chained records
                             ├─ cache/     request-key → response index
                             └─ commitments/  Merkle roots + Rekor anchor receipts
+
+Rust, ~2.5k lines: `tokio`/`axum` proxy, a line-streamed stdio MCP wrapper, BLAKE3 hashing (incremental — streams are fingerprinted as they pass through), `ed25519-dalek`, flat-file git-style CAS, JSONL hash-chained journal, hand-rolled Merkle (~100 lines, fully tested). One static binary, no database, no daemon dependencies.
+
+```
+agent ─────signed request────▶ witness serve ──▶ model API     (model boundary)
+MCP client ──stdio JSON-RPC──▶ witness mcp   ──▶ MCP server    (tool boundary)
+                                    │
+                                    ├─ objects/     content-addressed bodies
+                                    ├─ journal.log  one hash chain over both
+                                    ├─ cache/       request-key → response index
+                                    └─ commitments/ Merkle roots
 ```
 
 ## Roadmap
 
+- MCP beyond v1: Streamable HTTP transport, recording `resources/*` and `prompts/*`, and Pact identity carried in `_meta` so tool calls are attributed to a key rather than a label
 - Fleet mode: shared cache across many witness instances (consistent hashing, gRPC)
 - OpenAI-compatible upstream shapes (`/v1/chat/completions`) — the proxy is path-agnostic today, cache/audit already work
 - Verifier oracles: mark records `verified-by` (test suite, Lean check) to unlock unconditional reuse
