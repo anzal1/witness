@@ -8,6 +8,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
+use axum::routing::get;
 use axum::Router;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cas::Cas;
@@ -24,10 +26,14 @@ use crate::identity::{
     HDR_IDENTITY, HDR_SIGNATURE, HDR_TIMESTAMP,
 };
 use crate::journal::{now_ms, InvokeEntry, Journal};
+use crate::metrics::Metrics;
+use crate::otlp::{self, Exporter, SpanData};
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Allow a caller to opt a nondeterministic request into cache reuse.
 pub const HDR_CACHE_OPT_IN: &str = "x-witness-cache";
+/// Local introspection. Never proxied, never recorded, never journaled.
+pub const METRICS_PATH: &str = "/witness/metrics";
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -47,6 +53,9 @@ pub struct Options {
     pub cache: bool,
     /// Replay mode: never contact the upstream; cache misses are errors.
     pub replay: bool,
+    /// OTLP/HTTP collector to project recorded calls onto as GenAI spans.
+    /// `None` disables the exporter entirely, including its background task.
+    pub otlp_endpoint: Option<String>,
 }
 
 /// Cache index entry: maps a request key to the stored response.
@@ -64,12 +73,47 @@ pub struct App {
     client: reqwest::Client,
     opts: Options,
     cache_dir: PathBuf,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    metrics: Arc<Metrics>,
+    otlp: Option<Exporter>,
+    /// Resolved once from the upstream URL; every span carries it.
+    gen_ai_system: &'static str,
     tmp_counter: AtomicU64,
 }
 
 impl App {
+    /// Project one recorded call onto a GenAI span. No-op without `--otlp-endpoint`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_span(
+        &self,
+        start_unix_nanos: u64,
+        seq: u64,
+        cache: &str,
+        req_hash: &str,
+        resp_hash: &str,
+        agent: &str,
+        model: &Option<String>,
+        status: u16,
+    ) {
+        let Some(exporter) = &self.otlp else {
+            return;
+        };
+        exporter.emit(
+            SpanData {
+                seq,
+                model: model.clone(),
+                cache: cache.to_string(),
+                req_hash: req_hash.to_string(),
+                resp_hash: resp_hash.to_string(),
+                agent: agent.to_string(),
+                system: self.gen_ai_system,
+                start_unix_nanos,
+                end_unix_nanos: otlp::now_unix_nanos(),
+                status,
+            },
+            &self.metrics,
+        );
+    }
+
     fn cache_path(&self, req_key: &str) -> PathBuf {
         self.cache_dir.join(req_key)
     }
@@ -113,25 +157,41 @@ pub async fn serve(opts: Options) -> Result<()> {
         .build()?;
     let port = opts.port;
     let replay = opts.replay;
+    let metrics = Arc::new(Metrics::default());
+    let gen_ai_system = otlp::gen_ai_system(&opts.upstream);
+    let otlp = opts
+        .otlp_endpoint
+        .as_deref()
+        .map(|endpoint| Exporter::spawn(endpoint, client.clone(), metrics.clone()));
+    if let Some(endpoint) = &opts.otlp_endpoint {
+        eprintln!(
+            "witness: OTLP GenAI spans to {}",
+            otlp::traces_url(endpoint)
+        );
+    }
     let app = Arc::new(App {
         cas,
         journal,
         client,
         opts,
         cache_dir,
-        hits: AtomicU64::new(0),
-        misses: AtomicU64::new(0),
+        metrics,
+        otlp,
+        gen_ai_system,
         tmp_counter: AtomicU64::new(0),
     });
 
-    let router = Router::new().fallback(handle).with_state(app);
+    let router = Router::new()
+        .route(METRICS_PATH, get(metrics_endpoint))
+        .fallback(handle)
+        .with_state(app);
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
     eprintln!(
-        "witness {} on http://{addr}  (journal + CAS recording every call)",
+        "witness {} on http://{addr}  (journal + CAS recording every call, metrics at {METRICS_PATH})",
         if replay { "REPLAY" } else { "serving" }
     );
     axum::serve(listener, router).await?;
@@ -293,7 +353,25 @@ fn witness_headers(resp: &mut Response, seq: u64, req_key: &str, resp_hash: &str
     h.insert("x-witness-cache", HeaderValue::from_str(cache).unwrap());
 }
 
+/// Local introspection endpoint. It is a route rather than a branch inside
+/// `handle` so the path can never reach the recording or forwarding path.
+async fn metrics_endpoint(State(app): State<Arc<App>>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(Body::from(app.metrics.render(app.journal.len())))
+        .unwrap()
+}
+
 async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
+    let started = Instant::now();
+    let response = proxy_request(&app, req).await;
+    app.metrics.observe(started.elapsed());
+    response
+}
+
+async fn proxy_request(app: &Arc<App>, req: Request) -> Response {
+    let start_unix_nanos = otlp::now_unix_nanos();
     let method = req.method().clone();
     let path = req
         .uri()
@@ -307,10 +385,13 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
 
-    let caller = match authenticate(&app, &method, &path, &headers, &body) {
+    let caller = match authenticate(app, &method, &path, &headers, &body) {
         Ok(c) => c,
         Err((status, msg)) => return json_error(status, &msg),
     };
+    if caller.sig.is_some() {
+        app.metrics.signed.fetch_add(1, Ordering::Relaxed);
+    }
 
     let model = body_model(&body);
 
@@ -365,14 +446,19 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             }
         };
         let cache_kind = if app.opts.replay { "replay" } else { "hit" };
-        app.hits.fetch_add(1, Ordering::Relaxed);
+        if app.opts.replay {
+            app.metrics.replays.fetch_add(1, Ordering::Relaxed);
+        } else {
+            app.metrics.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        let agent = caller.agent.clone();
         let record = app.journal.append_invoke(InvokeEntry {
             agent: caller.agent,
             root: caller.root,
             req: body_hash.clone(),
             resp: entry.resp_hash.clone(),
             path: path.clone(),
-            model,
+            model: model.clone(),
             upstream: "cache".into(),
             cache: cache_kind.into(),
             status: entry.status,
@@ -399,11 +485,21 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             &entry.resp_hash,
             cache_kind,
         );
+        app.emit_span(
+            start_unix_nanos,
+            record.seq,
+            cache_kind,
+            &body_hash,
+            &entry.resp_hash,
+            &agent,
+            &model,
+            entry.status,
+        );
         return resp;
     }
 
     // --- forward upstream ---
-    app.misses.fetch_add(1, Ordering::Relaxed);
+    app.metrics.misses.fetch_add(1, Ordering::Relaxed);
     let url = format!("{}{}", app.opts.upstream.trim_end_matches('/'), path);
     let mut upstream_req = app.client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
@@ -423,10 +519,11 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     let upstream_resp = match upstream_req.body(body.to_vec()).send().await {
         Ok(r) => r,
         Err(e) => {
+            app.metrics.upstream_errors.fetch_add(1, Ordering::Relaxed);
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("upstream unreachable: {e}"),
-            )
+            );
         }
     };
 
@@ -444,14 +541,15 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         let bytes = match upstream_resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                app.metrics.upstream_errors.fetch_add(1, Ordering::Relaxed);
                 return json_error(
                     StatusCode::BAD_GATEWAY,
                     &format!("upstream read failed: {e}"),
-                )
+                );
             }
         };
         let (seq, resp_hash) = match record_response(
-            &app,
+            app,
             &caller,
             &req_key,
             &body_hash,
@@ -462,6 +560,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             &content_type,
             &bytes,
             true,
+            start_unix_nanos,
         ) {
             Ok(v) => v,
             Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
@@ -496,6 +595,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
                 }
                 Err(e) => {
                     failed = true;
+                    app2.metrics.upstream_errors.fetch_add(1, Ordering::Relaxed);
                     let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                     break;
                 }
@@ -514,6 +614,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             &ct2,
             &collected,
             !failed,
+            start_unix_nanos,
         ) {
             eprintln!("witness: failed to record streamed response: {e:#}");
         }
@@ -544,6 +645,7 @@ fn record_response(
     content_type: &str,
     bytes: &[u8],
     cacheable: bool,
+    start_unix_nanos: u64,
 ) -> Result<(u64, String)> {
     let resp_hash = app.cas.put(bytes)?;
     if status < 400 && cacheable {
@@ -569,5 +671,15 @@ fn record_response(
         status,
         sig: caller.sig.clone(),
     })?;
+    app.emit_span(
+        start_unix_nanos,
+        record.seq,
+        "miss",
+        body_hash,
+        &resp_hash,
+        &caller.agent,
+        model,
+        status,
+    );
     Ok((record.seq, resp_hash))
 }

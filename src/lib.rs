@@ -12,5 +12,7 @@ pub mod hash;
 pub mod identity;
 pub mod journal;
 pub mod merkle;
+pub mod metrics;
 pub mod mock;
+pub mod otlp;
 pub mod proxy;

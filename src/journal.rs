@@ -138,6 +138,16 @@ impl Journal {
         Ok(record)
     }
 
+    /// Sequence number of the last appended record, i.e. the journal's
+    /// length, without re-reading the file.
+    pub fn len(&self) -> u64 {
+        self.inner.lock().unwrap().next_seq - 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn read_all(&self) -> Result<Vec<Record>> {
         Self::read_all_from(&self.path)
     }
