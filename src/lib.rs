@@ -11,6 +11,7 @@ pub mod agent_record;
 pub mod anchor;
 pub mod cas;
 pub mod client;
+pub mod exec;
 pub mod hash;
 pub mod identity;
 pub mod journal;

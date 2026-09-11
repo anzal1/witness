@@ -16,6 +16,7 @@
 - **calls are attributed** — agents sign requests with Ed25519 keys carrying delegation chains from a human root key, verified locally with zero network calls (the **Pact** protocol);
 - **grants are enforced, not just logged** — delegations are narrowing-only (`model:claude-*`), and a request outside the grant is refused at the network boundary before it reaches the provider;
 - **tool calls join the same chain:** `witness mcp -- <server>` wraps a stdio MCP server, so one journal covers what your agents asked a model *and* what they did with tools;
+- **commands are recorded by what they changed:** `witness run -- <command>` fingerprints the working directory before and after, so the journal carries the side effects too and not only the instruction;
 - **single records are provable to outsiders** — a Merkle commitment lets you hand a third party an inclusion proof, or answer *"did any agent ever touch X?"* against a committed root.
 
 The ordering is the whole design bet. Audit tooling that asks to be adopted on principle doesn't get adopted, and a recorder switched on *after* a question is asked is worthless. So the thing you install for cost is the thing that turns out to be evidence — already running before anyone needed it.
@@ -190,6 +191,66 @@ Stated plainly, because the gaps matter more than the feature list:
 - **No identity yet.** MCP carries no Pact signature, so tool records are attributed to the `--agent` label rather than to a verified key. The label is operator asserted, not proven.
 - **Correlation is by JSON-RPC id.** A server that never answers a call leaves it unrecorded, and the summary says how many.
 
+## Recording command execution (Layer 3)
+
+The proxy records the **model** boundary and `witness mcp` records the **tool** boundary. Both capture a conversation. `witness run` records the **execution** boundary, which is where a conversation turns into a changed file:
+
+```bash
+witness run -- pytest -x                       # snapshot cwd, run, snapshot again
+witness run --dir ./service -- make build      # snapshot only this subtree
+witness run --agent nightly-ci -- ./deploy.sh  # label the record
+witness run --docker python:3.12 -- python etl.py
+witness diff --seq 42                          # what did that run change?
+```
+
+It runs the command the way a shell would. Your terminal still gets stdout and stderr live, stdin is still inherited, and the exit code is propagated, so `witness run -- <anything>` is a drop-in prefix inside a Makefile, a CI step, or an agent's shell tool.
+
+### What is recorded
+
+Before the command runs, witness walks the working directory and computes a BLAKE3 hash for every file. It runs the command, tees both output streams, then walks the directory again. The record is the difference between those two walks.
+
+One ordinary invoke record lands in the journal, so `verify`, `log`, `commit`, `prove` and `audit` work on it unchanged:
+
+| field | value |
+| --- | --- |
+| `agent` | `exec`, or whatever `--agent` says |
+| `path` | `exec:<command basename>` |
+| `upstream` | `exec`, or `exec:docker:<image>` |
+| `model` | absent, a command has no model |
+| `cache` | `miss`, a command has side effects and is never replayed |
+| `status` | `200` on exit 0, `500` on any other exit |
+| `req` | CAS hash of the invocation manifest |
+| `resp` | CAS hash of the result manifest |
+
+The two manifests are JSON objects in the same content-addressed store as every model body and tool frame:
+
+- **invocation:** `argv`, absolute `cwd`, `runtime` (`host` or `docker:<image>`), `started_ms`, and `pre_snapshot`, the hash of the before-walk.
+- **result:** `exit_code`, `duration_ms`, `stdout` and `stderr` (hashes of the captured bytes, plus their lengths), `post_snapshot`, counts of added, modified and deleted paths, and `diff`, the explicit list of changes with old and new hash on each side.
+- **snapshot:** the walk itself, a sorted map of relative path to `{hash, size}`. Sorted, so the manifest's own hash is stable and two runs over an unchanged tree produce one object.
+
+`witness audit --contains <string>` follows an execution record one hop into its captured stdout and stderr, so "which run printed this" is answerable and not just "which run was asked to do this".
+
+Directories that are noise or that would loop are never walked: `.git`, `target`, `node_modules`, and witness's own `witness-data`. Dotfiles are skipped too unless you pass `--include-hidden`, which reaches dotfiles but still never reaches those four. A tree over 50,000 files is refused with a message telling you to narrow `--dir`, and any file over 64 MB is hashed by streaming rather than being read into memory.
+
+### Trust model, stated plainly
+
+**This observes effects. It does not prevent them.** A snapshot diff is a description of what changed in one directory, produced by the same machine that ran the command. Nothing here stops a command from doing anything.
+
+`--docker <image>` bind-mounts the working directory at `/work` and runs the command inside the image (`docker run --rm -v <dir>:/work -w /work <image> <cmd...>`). That adds real containment: the command reaches the mounted directory and whatever the image gives it, and not the rest of your filesystem. But containment is not proof. The record still says what witness observed on the host side of the mount, not what the container was prevented from doing, and it inherits whatever you think of the image, the daemon, and the kernel underneath. If Docker is not running, `--docker` fails immediately with a clear message rather than quietly falling back to the host.
+
+Treat `witness run` as a flight recorder for commands, not as a sandbox. If you need a sandbox, run one, and point witness at it.
+
+### Honest limits
+
+- **Writes outside `--dir` are invisible.** A command that edits `/etc`, your home directory, or a sibling checkout produces an empty diff. The record's scope is exactly one subtree.
+- **Network side effects are invisible.** A command that POSTs your database to a stranger and changes no file looks identical to `true`. Route model and tool traffic through `witness serve` and `witness mcp` if you want that leg recorded.
+- **Only file content is diffed.** Permission and ownership changes, mtimes, empty directories created or removed, and extended attributes leave no trace.
+- **Symlinks are skipped.** Following them would let a snapshot wander outside `--dir` and could cycle, so links are neither followed nor recorded, and a command that only changes a link's target shows nothing.
+- **The diff is a before-and-after, not a history.** A file written, deleted, and rewritten byte-identically inside one command is correctly reported as unchanged, because it is. Intermediate states are not observed.
+- **Concurrent writers confuse it.** If something else edits the directory while the command runs, that edit is attributed to the command. The boundary is temporal, not causal.
+- **No identity yet.** Like MCP, a command carries no Pact signature, so the record is attributed to the `--agent` label. That label is operator asserted, not proven.
+- **Skipped by default means skipped in evidence.** If your command's real output lands in `target/` or `node_modules/`, narrow `--dir` to it, because the default skip list will hide it.
+
 ## Cache policy (honest by design)
 
 LLM calls are nondeterministic. Everything is **recorded**, but a response is only **reused** when that's semantically sound: `temperature: 0`, an explicit `seed`, or the caller opting in with `x-witness-cache: allow`. Replay mode reuses everything — that's its point.
@@ -300,6 +361,7 @@ Rust, ~2.5k lines: `tokio`/`axum` proxy, a line-streamed stdio MCP wrapper, BLAK
 ```
 agent ─────signed request────▶ witness serve ──▶ model API     (model boundary)
 MCP client ──stdio JSON-RPC──▶ witness mcp   ──▶ MCP server    (tool boundary)
+shell ───────────argv─────────▶ witness run   ──▶ command       (execution boundary)
                                     │
                                     ├─ objects/     content-addressed bodies
                                     ├─ journal.log  one hash chain over both
