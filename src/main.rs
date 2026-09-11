@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use witness::cas::Cas;
 use witness::identity::{self, Delegation, Keypair};
 use witness::journal::{self, Journal};
-use witness::{client, merkle, mock, proxy};
+use witness::{anchor, client, merkle, mock, proxy};
 
 #[derive(Parser)]
 #[command(
@@ -136,6 +136,30 @@ enum Command {
     },
     /// Verify the chain and write a Merkle commitment over the journal.
     Commit,
+    /// Publish a commitment to the Sigstore Rekor transparency log.
+    Anchor {
+        /// Ed25519 key that signs the log entry.
+        #[arg(long)]
+        key: PathBuf,
+        /// Commitment file; defaults to the latest in commitments/.
+        #[arg(long)]
+        commitment: Option<PathBuf>,
+        /// Transparency log to publish to.
+        #[arg(long, default_value = anchor::REKOR_URL)]
+        rekor_url: String,
+        /// Print the exact entry that would be posted, and post nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Check a commitment against the Rekor entry that anchors it.
+    AnchorVerify {
+        /// Commitment file; defaults to the latest in commitments/.
+        #[arg(long)]
+        commitment: Option<PathBuf>,
+        /// Override the log recorded in the anchor receipt.
+        #[arg(long)]
+        rekor_url: Option<String>,
+    },
     /// Produce an inclusion proof for one record against a commitment.
     Prove {
         #[arg(long)]
@@ -367,11 +391,39 @@ async fn main() -> Result<()> {
             std::fs::write(&path, serde_json::to_vec_pretty(&commitment)?)?;
             println!("root: {}", hex::encode(root));
             eprintln!(
-                "committed {} records -> {}\n(anchor this root externally — a transparency log, a tweet, an email — to make it binding)",
+                "committed {} records -> {}\nanchor it to make it binding:  witness anchor --key <keyfile>",
                 records.len(),
                 path.display()
             );
             Ok(())
+        }
+        Command::Anchor {
+            key,
+            commitment,
+            rekor_url,
+            dry_run,
+        } => {
+            let commitment_path = match commitment {
+                Some(p) => p,
+                None => latest_commitment(&data_dir)?,
+            };
+            anchor::anchor(anchor::AnchorOptions {
+                commitment: &commitment_path,
+                key: &key,
+                rekor_url: &rekor_url,
+                dry_run,
+            })
+            .await
+        }
+        Command::AnchorVerify {
+            commitment,
+            rekor_url,
+        } => {
+            let commitment_path = match commitment {
+                Some(p) => p,
+                None => latest_commitment(&data_dir)?,
+            };
+            anchor::verify(&commitment_path, rekor_url.as_deref()).await
         }
         Command::Prove { seq, commitment } => {
             let commitment_path = match commitment {
@@ -514,6 +566,8 @@ fn latest_commitment(data_dir: &std::path::Path) -> Result<PathBuf> {
         .context("no commitments yet — run `witness commit` first")?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        // Anchor receipts live beside their commitments; they are not one.
+        .filter(|p| !p.to_string_lossy().ends_with(".anchor.json"))
         .collect();
     entries.sort();
     entries

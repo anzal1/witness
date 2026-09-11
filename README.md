@@ -56,7 +56,9 @@ Headers: `x-pact-identity` (hex pubkey), `x-pact-timestamp`, `x-pact-signature` 
 
 ```bash
 witness verify                     # journal hash chain intact?
-witness commit                     # Merkle root over the run — anchor it anywhere public
+witness commit                     # Merkle root over the run
+witness anchor --key keys/alice    # publish that root to Sigstore Rekor
+witness anchor-verify              # the log still says what the local file says
 witness prove --seq 42 > proof.json
 witness verify-proof proof.json    # third-party checkable
 witness audit --contains "secret-dataset-name"
@@ -64,6 +66,29 @@ witness replay --port 8788         # serve the recorded run; zero upstream calls
 ```
 
 Every response carries `x-witness-seq`, `x-witness-req`, `x-witness-resp` (BLAKE3 hashes), and `x-witness-cache: miss|hit|replay`.
+
+### Anchoring to Rekor
+
+A commitment sitting on your own disk is a claim about your own disk. Anchoring turns it into something a stranger can check:
+
+```bash
+witness anchor --key keys/alice                 # signs + publishes the latest commitment
+witness anchor --key keys/alice --dry-run       # print the exact entry, post nothing
+witness anchor-verify                           # re-fetch it and compare against the local file
+```
+
+`witness anchor` builds a Sigstore [`hashedrekord`](https://rekor.sigstore.dev) entry over the commitment file: its SHA-256, an Ed25519 signature by your key, and that key in SPKI/PEM form. It POSTs the entry to `https://rekor.sigstore.dev`, then writes the returned UUID and log index to `<commitment>.anchor.json`. Rekor is a public append-only log with its own signed timestamps, so the entry fixes the root in time: you cannot mint a root later and claim you held it earlier.
+
+The log never sees your journal, your prompts, or your responses. It sees one 32-byte digest and one signature.
+
+Anyone can check the entry without installing witness:
+
+```bash
+rekor-cli get --uuid <uuid> --rekor_server https://rekor.sigstore.dev
+# or open https://search.sigstore.dev/?uuid=<uuid>
+```
+
+Use `--commitment <path>` to anchor an older commitment, and `--rekor-url` to target a private or self-hosted log.
 
 ## Cache policy (honest by design)
 
@@ -135,7 +160,7 @@ This is a crowded space, and several projects overlap heavily with witness. Some
 | **[Wirken](https://github.com/gebruder/wirken)** (Rust, MIT) | Very high — per-agent Ed25519 identity signing a hash-chain head, SHA-256 chain, offline `sessions verify`, reproducible replay, capability-attenuated sub-agent delegation | Credential vault, per-channel process isolation, sandboxed exec, SIEM forwarding, OTel GenAI semconv. Bigger, older, actively developed |
 | **[Bifrost](https://docs.getbifrost.ai/overview)** (commercial) | HMAC-signed audit events at creation, append-only archival | ~11µs gateway overhead vs witness's ~250µs |
 | **[LiteLLM](https://github.com/BerriAI/litellm/discussions/25237)** (PRs #25329 / #30238) | Per-call post-quantum (ML-DSA-65) signature chaining, offline verification | Lives inside the most widely deployed LLM proxy |
-| **[Armalo](https://www.armalo.ai/learn/merkle-tree-agent-audit-logs)** | Merkle audit logs **anchored to Sigstore Rekor** with inclusion proofs | Already ships the external anchoring that is only issue #2 here |
+| **[Armalo](https://www.armalo.ai/learn/merkle-tree-agent-audit-logs)** | Merkle audit logs **anchored to Sigstore Rekor** with inclusion proofs | Purpose-built audit product with a hosted UI; witness now anchors to Rekor too (`witness anchor`) |
 | **[IETF draft-maintainer-1f916-agent-record](https://datatracker.ietf.org/doc/draft-maintainer-1f916-agent-record/)** | Ed25519-bound append-only logs, signed Merkle heads, independent countersigning witnesses | It is becoming a **standard**; witness currently implements a bespoke format |
 | LiteLLM / Helicone / Portkey (base features) | Proxying, caching, logging | Mature, hosted, multi-provider |
 | Dapr 1.18 attestation, OTel GenAI semconv | Workflow-history signing; trace schema | Established ecosystems |
@@ -153,11 +178,11 @@ If you need a production agent gateway today, look at Wirken first. If you want 
 
 - It cannot see influence through **model weights** — if data leaked into training, no request trace shows it.
 - A prompt-injected agent holding a valid delegation is authorized-and-rogue; witness narrows the blast radius and gives perfect forensics, it does not prevent the injection.
-- Commitments bind only if published externally (a transparency log, a timestamped post). An unpublished root proves nothing to anyone else.
+- Commitments bind only once published externally. `witness anchor` does that for you, but an *unanchored* root still proves nothing to anyone else, and anchoring inherits whatever trust you place in the Rekor instance you publish to.
 
 ## Design
 
-Rust, ~2k lines: `tokio`/`axum` proxy, BLAKE3 hashing (incremental — streams are fingerprinted as they pass through), `ed25519-dalek`, flat-file git-style CAS, JSONL hash-chained journal, hand-rolled Merkle (~100 lines, fully tested). One static binary, no database, no daemon dependencies.
+Rust, ~2k lines: `tokio`/`axum` proxy, BLAKE3 hashing (incremental, so streams are fingerprinted as they pass through), `ed25519-dalek` (plus SHA-256, but only where Rekor's entry format demands it), flat-file git-style CAS, JSONL hash-chained journal, hand-rolled Merkle (~100 lines, fully tested). One static binary, no database, no daemon dependencies.
 
 ```
 agent ──signed request──▶ witness ──▶ model API
@@ -165,12 +190,11 @@ agent ──signed request──▶ witness ──▶ model API
                             ├─ objects/   content-addressed bodies
                             ├─ journal.log  hash-chained records
                             ├─ cache/     request-key → response index
-                            └─ commitments/  Merkle roots
+                            └─ commitments/  Merkle roots + Rekor anchor receipts
 ```
 
 ## Roadmap
 
 - Fleet mode: shared cache across many witness instances (consistent hashing, gRPC)
 - OpenAI-compatible upstream shapes (`/v1/chat/completions`) — the proxy is path-agnostic today, cache/audit already work
-- Anchoring helper: publish commitment roots to a public transparency log (e.g. Rekor)
 - Verifier oracles: mark records `verified-by` (test suite, Lean check) to unlock unconditional reuse
