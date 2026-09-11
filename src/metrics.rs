@@ -17,6 +17,10 @@ pub struct Metrics {
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     pub replays: AtomicU64,
+    /// Fleet mode: requests answered out of a sibling instance's cache.
+    pub peer_hits: AtomicU64,
+    /// Peer lookups that failed rather than cleanly missed.
+    pub peer_errors: AtomicU64,
     pub signed: AtomicU64,
     pub upstream_errors: AtomicU64,
     pub otlp_exported: AtomicU64,
@@ -61,6 +65,14 @@ impl Metrics {
             "witness_requests_total{{cache=\"replay\"}} {}\n",
             g(&self.replays)
         ));
+        // A peer hit is exactly one request served, so one counter renders
+        // under two names. The label keeps `witness_requests_total` summing to
+        // the request total; the dedicated series below keeps fleet traffic
+        // readable on a dashboard without a label join.
+        out.push_str(&format!(
+            "witness_requests_total{{cache=\"peer\"}} {}\n",
+            g(&self.peer_hits)
+        ));
 
         out.push_str(
             "# HELP witness_requests_signed_total Requests carrying a verified Pact signature.\n",
@@ -80,6 +92,19 @@ impl Metrics {
         out.push_str(&format!(
             "witness_upstream_errors_total {}\n",
             g(&self.upstream_errors)
+        ));
+
+        out.push_str(
+            "# HELP witness_peer_hits_total Requests answered from a sibling instance's cache instead of the upstream.\n",
+        );
+        out.push_str("# TYPE witness_peer_hits_total counter\n");
+        out.push_str(&format!("witness_peer_hits_total {}\n", g(&self.peer_hits)));
+
+        out.push_str("# HELP witness_peer_errors_total Peer lookups that failed rather than cleanly missed: unreachable, unauthorized, over budget, or a body that did not match its advertised hash.\n");
+        out.push_str("# TYPE witness_peer_errors_total counter\n");
+        out.push_str(&format!(
+            "witness_peer_errors_total {}\n",
+            g(&self.peer_errors)
         ));
 
         out.push_str(

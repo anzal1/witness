@@ -31,7 +31,7 @@ pub struct Record {
     pub path: String,
     pub model: Option<String>,
     pub upstream: String,
-    /// "hit" | "miss" | "replay"
+    /// "hit" | "miss" | "peer" | "replay"
     pub cache: String,
     pub status: u16,
     /// Agent's request signature (hex), if the request was signed.
