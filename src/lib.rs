@@ -4,8 +4,10 @@
 //! - Pact: Ed25519 agent identity + narrowing-only delegation chains,
 //!   verified locally at the proxy boundary.
 //! - AgentReplay: content-addressed recording of every call in a
-//!   hash-chained journal, with deterministic replay and Merkle commitments.
+//!   hash-chained journal, with deterministic replay and Merkle commitments,
+//!   anchored to a public transparency log.
 
+pub mod anchor;
 pub mod cas;
 pub mod client;
 pub mod hash;
