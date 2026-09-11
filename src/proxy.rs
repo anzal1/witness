@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cas::Cas;
@@ -25,7 +26,7 @@ use crate::identity::{
     caps_allow_model, chain_from_b64, verify_chain, verify_request_signature, HDR_DELEGATION,
     HDR_IDENTITY, HDR_SIGNATURE, HDR_TIMESTAMP,
 };
-use crate::journal::{now_ms, InvokeEntry, Journal};
+use crate::journal::{now_ms, InvokeEntry, Journal, Record};
 use crate::metrics::Metrics;
 use crate::oracle;
 use crate::otlp::{self, Exporter, SpanData};
@@ -391,6 +392,26 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
         .unwrap()
 }
 
+/// `Journal::append_invoke` blocks until the writer thread has committed the
+/// batch the entry landed in. That is microseconds, but it is still a blocking
+/// wait on a runtime worker, so hand that worker's other tasks to a sibling
+/// thread for the duration instead of parking them behind a disk write.
+/// `block_in_place` rather than `spawn_blocking` because the callers hold
+/// borrows (`&App`, `&Caller`) that a `'static` closure would force us to
+/// clone on every request; the wait is short and the entry is already built,
+/// so there is nothing to gain by moving it to another thread. The proxy runs
+/// on the multi-threaded runtime, where `block_in_place` is legal; the direct
+/// call keeps this correct if anything ever drives it from a current-thread
+/// runtime, where `block_in_place` panics.
+fn append_blocking(journal: &Journal, entry: InvokeEntry) -> Result<Record> {
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(|| journal.append_invoke(entry))
+        }
+        _ => journal.append_invoke(entry),
+    }
+}
+
 fn witness_headers(resp: &mut Response, seq: u64, req_key: &str, resp_hash: &str, cache: &str) {
     let h = resp.headers_mut();
     h.insert(
@@ -710,18 +731,21 @@ async fn proxy_request(app: &Arc<App>, req: Request) -> Response {
             app.metrics.hits.fetch_add(1, Ordering::Relaxed);
         }
         let agent = caller.agent.clone();
-        let record = app.journal.append_invoke(InvokeEntry {
-            agent: caller.agent,
-            root: caller.root,
-            req: body_hash.clone(),
-            resp: entry.resp_hash.clone(),
-            path: path.clone(),
-            model: model.clone(),
-            upstream: "cache".into(),
-            cache: cache_kind.into(),
-            status: entry.status,
-            sig: caller.sig,
-        });
+        let record = append_blocking(
+            &app.journal,
+            InvokeEntry {
+                agent: caller.agent,
+                root: caller.root,
+                req: body_hash.clone(),
+                resp: entry.resp_hash.clone(),
+                path: path.clone(),
+                model: model.clone(),
+                upstream: "cache".into(),
+                cache: cache_kind.into(),
+                status: entry.status,
+                sig: caller.sig,
+            },
+        );
         let record = match record {
             Ok(r) => r,
             Err(e) => {
@@ -949,18 +973,21 @@ fn record_response(
             },
         )?;
     }
-    let record = app.journal.append_invoke(InvokeEntry {
-        agent: caller.agent.clone(),
-        root: caller.root.clone(),
-        req: body_hash.to_string(),
-        resp: resp_hash.clone(),
-        path: path.to_string(),
-        model: model.clone(),
-        upstream: upstream.to_string(),
-        cache: "miss".into(),
-        status,
-        sig: caller.sig.clone(),
-    })?;
+    let record = append_blocking(
+        &app.journal,
+        InvokeEntry {
+            agent: caller.agent.clone(),
+            root: caller.root.clone(),
+            req: body_hash.to_string(),
+            resp: resp_hash.clone(),
+            path: path.to_string(),
+            model: model.clone(),
+            upstream: upstream.to_string(),
+            cache: "miss".into(),
+            status,
+            sig: caller.sig.clone(),
+        },
+    )?;
     app.emit_span(
         start_unix_nanos,
         record.seq,
