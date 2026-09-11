@@ -15,10 +15,10 @@ use base64::Engine;
 // SPKI stack stays pinned to whatever version the signing crate resolved.
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePublicKey, EncodePublicKey};
-use ed25519_dalek::{Signer, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::path::{Path, PathBuf};
 
 use crate::identity::Keypair;
@@ -62,6 +62,10 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+pub fn sha512_hex(data: &[u8]) -> String {
+    hex::encode(Sha512::digest(data))
+}
+
 /// Ed25519 verifying key as an SPKI PEM block. Rekor's `hashedrekord` takes
 /// x509/PEM public keys, not the raw 32 bytes Pact passes around.
 pub fn public_key_pem(key: &VerifyingKey) -> Result<String> {
@@ -76,7 +80,17 @@ pub fn public_key_from_pem(pem: &str) -> Result<VerifyingKey> {
 /// Build the Rekor `hashedrekord` proposed entry for an artifact. The log
 /// stores only the digest and the signature, never the artifact bytes.
 pub fn proposed_entry(artifact: &[u8], key: &Keypair) -> Result<Value> {
-    let signature = key.signing.sign(artifact);
+    // Rekor's hashedrekord verifier for Ed25519 keys accepts only the
+    // pre-hashed variant: Ed25519ph (RFC 8032 section 5.1) over a SHA-512
+    // digest, with the entry's hash field carrying that same sha512. A pure
+    // Ed25519 signature with a sha256 field is rejected with "unsupported
+    // hash algorithm", verified against the live service.
+    let mut prehash = Sha512::new();
+    prehash.update(artifact);
+    let signature = key
+        .signing
+        .sign_prehashed(prehash, None)
+        .map_err(|e| anyhow::anyhow!("ed25519ph signing failed: {e}"))?;
     let pem = public_key_pem(&key.signing.verifying_key())?;
     let b64 = base64::engine::general_purpose::STANDARD;
     Ok(serde_json::json!({
@@ -85,8 +99,8 @@ pub fn proposed_entry(artifact: &[u8], key: &Keypair) -> Result<Value> {
         "spec": {
             "data": {
                 "hash": {
-                    "algorithm": "sha256",
-                    "value": sha256_hex(artifact),
+                    "algorithm": "sha512",
+                    "value": sha512_hex(artifact),
                 }
             },
             "signature": {
@@ -242,11 +256,14 @@ pub async fn verify(commitment: &Path, rekor_url: Option<&str>) -> Result<()> {
         .trim_end_matches('/');
     let entry = fetch_entry(url, &receipt.uuid).await?;
     let logged = artifact_hash_from_entry(&entry)?;
+    // The log entry carries sha512 (the Ed25519ph requirement); the local
+    // receipt keeps sha256 as its own pin. Compare each against the artifact.
+    let local512 = sha512_hex(&artifact);
     let local = sha256_hex(&artifact);
 
-    if logged != local {
+    if logged != local512 {
         bail!(
-            "MISMATCH: Rekor entry {} attests to sha256 {logged}, but {} hashes to {local}",
+            "MISMATCH: Rekor entry {} attests to sha512 {logged}, but {} hashes to {local512}",
             receipt.uuid,
             commitment.display()
         );
@@ -291,7 +308,7 @@ async fn fetch_entry(rekor_url: &str, uuid: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signature, Verifier};
+    use ed25519_dalek::Signature;
 
     fn kp() -> Keypair {
         Keypair::generate().unwrap()
@@ -327,14 +344,14 @@ mod tests {
 
         assert_eq!(entry["kind"], "hashedrekord");
         assert_eq!(entry["apiVersion"], "0.0.1");
-        assert_eq!(entry["spec"]["data"]["hash"]["algorithm"], "sha256");
+        assert_eq!(entry["spec"]["data"]["hash"]["algorithm"], "sha512");
         assert_eq!(
             entry["spec"]["data"]["hash"]["value"].as_str().unwrap(),
-            sha256_hex(artifact)
+            sha512_hex(artifact)
         );
 
-        // The signature is over the artifact bytes and verifies under the
-        // embedded PEM key, which is exactly what a Rekor verifier redoes.
+        // The signature is Ed25519ph over the SHA-512 prehash and verifies
+        // under the embedded PEM key, which is exactly what Rekor redoes.
         let sig_bytes: [u8; 64] =
             b64_decode(entry["spec"]["signature"]["content"].as_str().unwrap())
                 .try_into()
@@ -346,14 +363,15 @@ mod tests {
         ))
         .unwrap();
         let verifying = public_key_from_pem(&pem).unwrap();
+        let mut ph = Sha512::new();
+        ph.update(artifact);
         verifying
-            .verify(artifact, &Signature::from_bytes(&sig_bytes))
+            .verify_prehashed(ph, None, &Signature::from_bytes(&sig_bytes))
             .unwrap();
+        let mut other = Sha512::new();
+        other.update(b"a different commitment");
         assert!(verifying
-            .verify(
-                b"a different commitment",
-                &Signature::from_bytes(&sig_bytes)
-            )
+            .verify_prehashed(other, None, &Signature::from_bytes(&sig_bytes))
             .is_err());
     }
 
@@ -380,7 +398,7 @@ mod tests {
         });
         assert_eq!(
             artifact_hash_from_entry(&entry).unwrap(),
-            sha256_hex(artifact)
+            sha512_hex(artifact)
         );
         assert!(artifact_hash_from_entry(&serde_json::json!({"body": "!!not base64"})).is_err());
         assert!(artifact_hash_from_entry(&serde_json::json!({})).is_err());
