@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use witness::cas::Cas;
 use witness::identity::{self, Delegation, Keypair};
 use witness::journal::{self, Journal};
-use witness::{agent_record, anchor, client, mcp, merkle, mock, oracle, proxy};
+use witness::{agent_record, anchor, client, exec, mcp, merkle, mock, oracle, proxy};
 
 #[derive(Parser)]
 #[command(
@@ -61,6 +61,29 @@ enum Command {
         /// The MCP server command and its arguments, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Run a command, recording the side effects it left in a directory.
+    Run {
+        /// Directory to snapshot and run in. Defaults to the current directory.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Journal identity recorded for this execution.
+        #[arg(long, default_value = exec::DEFAULT_AGENT)]
+        agent: String,
+        /// Run inside this Docker image, with the directory bind-mounted at /work.
+        #[arg(long)]
+        docker: Option<String>,
+        /// Also snapshot dotfiles and dot-directories.
+        #[arg(long)]
+        include_hidden: bool,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Show what a recorded execution changed on disk.
+    Diff {
+        #[arg(long)]
+        seq: u64,
     },
     /// Run a fake Anthropic-shaped upstream for demos and tests.
     Mock {
@@ -295,6 +318,26 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
+        Command::Run {
+            dir,
+            agent,
+            docker,
+            include_hidden,
+            command,
+        } => {
+            // Exit with the wrapped command's code: whoever called witness
+            // should see the process they think they launched.
+            let code = exec::run(exec::Options {
+                data_dir,
+                dir,
+                agent,
+                docker,
+                include_hidden,
+                command,
+            })?;
+            std::process::exit(code);
+        }
+        Command::Diff { seq } => exec::show_diff(&data_dir, seq),
         Command::Mock { port, latency_ms } => mock::serve(port, latency_ms).await,
         Command::Keygen { out } => {
             let key = Keypair::generate()?;
@@ -611,7 +654,13 @@ async fn main() -> Result<()> {
             let needle = contains.as_bytes();
             let mut matches = 0usize;
             for r in &records {
-                for (side, hash) in [("request", &r.req), ("response", &r.resp)] {
+                // An execution's req/resp are manifests that name its output
+                // rather than carry it, so audit follows them one hop into the
+                // captured stdout and stderr. Every other record yields none.
+                let linked = exec::linked_objects(&cas, r);
+                let mut sides: Vec<(&str, &str)> = vec![("request", &r.req), ("response", &r.resp)];
+                sides.extend(linked.iter().map(|(side, hash)| (*side, hash.as_str())));
+                for (side, hash) in sides {
                     if let Ok(Some(obj)) = cas.get(hash) {
                         if obj.windows(needle.len()).any(|w| w == needle) {
                             matches += 1;
