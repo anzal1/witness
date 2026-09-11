@@ -6,7 +6,7 @@ description = "A provenance-native caching proxy for model APIs: signed identiti
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "fs", "io-util", "io-std", "process"] }
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 blake3 = "1"

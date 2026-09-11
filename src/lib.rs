@@ -11,6 +11,7 @@ pub mod client;
 pub mod hash;
 pub mod identity;
 pub mod journal;
+pub mod mcp;
 pub mod merkle;
 pub mod mock;
 pub mod proxy;

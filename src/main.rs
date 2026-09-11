@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use witness::cas::Cas;
 use witness::identity::{self, Delegation, Keypair};
 use witness::journal::{self, Journal};
-use witness::{client, merkle, mock, proxy};
+use witness::{client, mcp, merkle, mock, proxy};
 
 #[derive(Parser)]
 #[command(
@@ -45,6 +45,15 @@ enum Command {
     Replay {
         #[arg(long, default_value_t = 8787)]
         port: u16,
+    },
+    /// Wrap a stdio MCP server, recording its tool calls into the same journal.
+    Mcp {
+        /// Journal identity recorded for this session's tool calls.
+        #[arg(long, default_value = mcp::DEFAULT_AGENT)]
+        agent: String,
+        /// The MCP server command and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
     /// Run a fake Anthropic-shaped upstream for demos and tests.
     Mock {
@@ -192,6 +201,17 @@ async fn main() -> Result<()> {
                 replay: true,
             })
             .await
+        }
+        Command::Mcp { agent, command } => {
+            // Exit with the wrapped server's code: the MCP client should see
+            // the process it thinks it launched, not the wrapper.
+            let code = mcp::run(mcp::Options {
+                data_dir,
+                agent,
+                command,
+            })
+            .await?;
+            std::process::exit(code);
         }
         Command::Mock { port, latency_ms } => mock::serve(port, latency_ms).await,
         Command::Keygen { out } => {

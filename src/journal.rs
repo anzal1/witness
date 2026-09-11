@@ -260,4 +260,36 @@ mod tests {
         assert_eq!(Journal::verify_chain(&records).unwrap(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Journals outlive the binary that wrote them, so a record written before
+    /// the tool boundary existed must still parse and still hash to the value
+    /// stored in it. These two lines are verbatim output from the model-proxy
+    /// path, one with the optional identity fields and one without. Any change
+    /// to `Record` that alters the serialized form breaks this test, which is
+    /// the point: new fields must be additive and skipped when absent.
+    #[test]
+    fn records_written_before_the_tool_boundary_still_verify() {
+        const WITH_IDENTITY: &str = r#"{"seq":1,"ts_ms":1789112274191,"prev":"0000000000000000000000000000000000000000000000000000000000000000","kind":"invoke","agent":"b1946ac92492d2347c6235b4d2611184","root":"9f86d081884c7d659a2feaa0c55ad015","req":"0000000000000000000000000000000000000000000000000000000000000010","resp":"0000000000000000000000000000000000000000000000000000000000000011","path":"/v1/messages","model":"claude-sonnet-5","upstream":"http://127.0.0.1:9700","cache":"miss","status":200,"sig":"deadbeef","hash":"cae4937997cf7ce514f31a050e756ca6ddcdc8c858ecc8076d86478915922dcd"}"#;
+        const ANONYMOUS: &str = r#"{"seq":1,"ts_ms":1789112285686,"prev":"0000000000000000000000000000000000000000000000000000000000000000","kind":"invoke","agent":"b1946ac92492d2347c6235b4d2611184","req":"0000000000000000000000000000000000000000000000000000000000000010","resp":"0000000000000000000000000000000000000000000000000000000000000011","path":"/v1/messages","model":"claude-sonnet-5","upstream":"http://127.0.0.1:9700","cache":"miss","status":200,"hash":"86c5b4bc12e270150c301a267c54a7289390f06b65c7e31683255d4226e93511"}"#;
+
+        for line in [WITH_IDENTITY, ANONYMOUS] {
+            let record: Record = serde_json::from_str(line).expect("old record parses");
+            assert_eq!(record.kind, "invoke");
+            assert_eq!(record.model.as_deref(), Some("claude-sonnet-5"));
+            assert_eq!(
+                Journal::verify_chain(std::slice::from_ref(&record)).unwrap(),
+                1,
+                "an old record must still hash to the value it carries"
+            );
+            // Round-tripping must be byte-identical, or a re-read journal
+            // would no longer match the commitments taken over it.
+            assert_eq!(serde_json::to_string(&record).unwrap(), line);
+        }
+
+        // The anonymous line omits `root` and `sig` entirely; they must come
+        // back as None rather than failing the parse.
+        let anon: Record = serde_json::from_str(ANONYMOUS).unwrap();
+        assert_eq!(anon.root, None);
+        assert_eq!(anon.sig, None);
+    }
 }
